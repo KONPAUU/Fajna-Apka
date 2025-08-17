@@ -9,19 +9,19 @@ import crypto from "crypto";
 const {
   PORT = 3100,
 
-  // Które kanały obserwować (slugi, małymi literami, przecinki)
+  // Slugi kanałów (CSV, małe litery)
   ALLOWED_SLUGS = "",
 
-  // (opcjonalnie) NAZWĘ Twojego konta bota, żeby nie liczyć jego wiadomości
+  // (opcjonalnie) login Twojego bota, żeby nie liczyć jego wiadomości
   BOT_USERNAME = "",
 
-  // Ile identycznych pod rząd, by zareagować
+  // Ile identycznych komend pod rząd, by zareagować
   ECHO_THRESHOLD = "5",
 
-  // Cooldown na komendę (sekundy) – żeby nie spamować tej samej komendy
+  // Cooldown na komendę (sekundy)
   ECHO_COOLDOWN_SECONDS = "120",
 
-  // Komendy do ignorowania (pełna treść, lowercase, CSV)
+  // Komendy do zignorowania (pełna treść, lowercase, CSV)
   IGNORE_EXACT = "!points",
 
   // ===== OAuth Kick =====
@@ -33,13 +33,17 @@ const {
   // np. "rybsonlol:2968509,drugi:12345"
   CHATROOM_ID_OVERRIDES = "",
 
-  // logowanie
+  // logowanie: info | silent
   LOG_LEVEL = "info"
 } = process.env;
 
 const allowedSlugs = ALLOWED_SLUGS.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 const ignoreExact = new Set(
-  IGNORE_EXACT.toLowerCase().split(",").map(s => s.trim()).filter(Boolean)
+  (IGNORE_EXACT || "")
+    .toLowerCase()
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
 );
 const echoThreshold = Math.max(2, Number(ECHO_THRESHOLD) || 5);
 const echoCooldownMs = Math.max(0, Number(ECHO_COOLDOWN_SECONDS) || 120) * 1000;
@@ -51,17 +55,19 @@ const HTML_HEADERS = { "User-Agent": UA, "Accept": "text/html,application/xhtml+
 
 const log = (...a) => { if (LOG_LEVEL !== "silent") console.log(...a); };
 
-/* ================== Tokeny (pamięć) ================== */
+/* ================== Tokeny (pamięć procesu) ================== */
 let TOKENS = {
   access_token: process.env.KICK_ACCESS_TOKEN || "",
   refresh_token: process.env.KICK_REFRESH_TOKEN || "",
   expires_at: 0
 };
+
 function setTokens(t) {
   if (t?.access_token) TOKENS.access_token = t.access_token;
   if (t?.refresh_token) TOKENS.refresh_token = t.refresh_token;
-  if (t?.expires_in) TOKENS.expires_at = Date.now() + (t.expires_in*1000) - 10_000;
+  if (t?.expires_in) TOKENS.expires_at = Date.now() + t.expires_in * 1000 - 10_000;
 }
+
 async function ensureToken() {
   if (TOKENS.access_token && Date.now() < TOKENS.expires_at) return TOKENS.access_token;
   if (!TOKENS.refresh_token) throw new Error("Brak refresh_token – uruchom /auth/start i dokończ logowanie.");
@@ -78,16 +84,12 @@ async function ensureToken() {
   return TOKENS.access_token;
 }
 
-/* ================== Pomocnicze ================== */
+/* ================== Utils ================== */
 function normalizeRaw(s) {
-  // porównujemy case-insensitive i ścinamy spacje
   return String(s || "").trim().toLowerCase();
 }
 function isCommand(s) {
   return String(s || "").trim().startsWith("!");
-}
-function isIgnoredExact(s) {
-  return ignoreExact.has(normalizeRaw(s));
 }
 
 /* ================== Kick API helpers ================== */
@@ -113,19 +115,21 @@ async function getChannelMeta(slug) {
       data?.id ?? data?.user_id ?? data?.user?.id ?? data?.data?.id ?? null;
     if (chatroom_id && broadcaster_user_id) return { chatroom_id, broadcaster_user_id };
   } catch {}
-  // 2) v2/chatroom
+
+  // 2) v2/chatroom + ponowny channels
   try {
     const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}/chatroom`, {
       timeout: 12000, headers: JSON_HEADERS
     });
     const chatroom_id = data?.id ?? null;
-    const { data: d2 } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
+    const d2 = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
       timeout: 12000, headers: JSON_HEADERS
-    }).catch(()=>({data:null}));
+    }).then(r => r.data).catch(() => null);
     const broadcaster_user_id =
       d2?.id ?? d2?.user_id ?? d2?.user?.id ?? d2?.data?.id ?? null;
     if (chatroom_id && broadcaster_user_id) return { chatroom_id, broadcaster_user_id };
   } catch {}
+
   // 3) HTML fallback
   try {
     const { data: html } = await axios.get(`https://kick.com/${encodeURIComponent(slug)}`, {
@@ -138,6 +142,7 @@ async function getChannelMeta(slug) {
     if (chatroom_id && broadcaster_user_id) return { chatroom_id, broadcaster_user_id };
   } catch {}
 
+  // 4) Ręczny override
   if (chatroomOverrideMap[slug]) {
     try {
       const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
@@ -166,7 +171,7 @@ const metaBySlug = new Map();                // slug -> { chatroom_id, broadcast
 const lastCmdsBySlug = new Map();            // slug -> array of {raw, norm, user, t}
 const lastEchoAt = new Map();                // key `${slug}|${cmdNorm}` -> ts
 
-function pushCmd(slug, item, limit = 10) {
+function pushCmd(slug, item, limit = 12) {
   const arr = lastCmdsBySlug.get(slug) || [];
   arr.push(item);
   if (arr.length > limit) arr.splice(0, arr.length - limit);
@@ -214,6 +219,7 @@ async function ensureWs(slug) {
   });
 
   const handler = (payload) => {
+    // wyciąganie nicka i treści
     const username =
       payload?.username || payload?.user?.username || payload?.sender?.username ||
       payload?.author?.username || payload?.message?.sender?.username || "";
@@ -225,7 +231,8 @@ async function ensureWs(slug) {
     const raw =
       String(payload?.content ?? payload?.message?.content ?? "").trim();
     if (!raw) return;
-    if (!raw.startsWith("!")) return;
+    if (!isCommand(raw)) return;
+
     const norm = normalizeRaw(raw);
     pushCmd(slug, { raw, norm, user: username || "unknown", t: Date.now() });
 
@@ -241,7 +248,7 @@ async function ensureWs(slug) {
         })
         .catch(e => {
           const st = e?.response?.status;
-          log("Echo send error", st, e?.response?.data || e.message);
+          log("Echo send error", st || "", e?.response?.data || e.message);
         });
     }
   };
@@ -274,15 +281,15 @@ app.get("/stats", (req, res) => {
 
 /* ===== OAuth ===== */
 const pkceByState = new Map();
-function sha256(buffer) { return crypto.createHash('sha256').update(buffer).digest(); }
-function base64urlencode(b) { return b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+function sha256(buffer) { return crypto.createHash("sha256").update(buffer).digest(); }
+function base64urlencode(b) { return b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
 function genPKCE() {
   const code_verifier = base64urlencode(crypto.randomBytes(32));
   const code_challenge = base64urlencode(sha256(code_verifier));
   return { code_verifier, code_challenge };
 }
 
-app.get("/auth/start", (req, res) => {
+app.get("/auth/start", (_req, res) => {
   if (!KICK_CLIENT_ID || !KICK_REDIRECT_URI) {
     return res.status(500).send("Missing OAuth envs");
   }
@@ -302,6 +309,28 @@ app.get("/auth/start", (req, res) => {
   url.searchParams.set("code_challenge_method", "S256");
 
   res.redirect(url.toString());
+});
+
+// pomocniczo – zobacz dokładnie jaki URL generuje (diagnostyka 404)
+app.get("/auth/url", (_req, res) => {
+  if (!KICK_CLIENT_ID || !KICK_REDIRECT_URI) {
+    return res.status(500).send("Brak KICK_CLIENT_ID/KICK_REDIRECT_URI");
+  }
+  const { code_verifier, code_challenge } = genPKCE();
+  const state = "dbg" + Date.now();
+  pkceByState.set(state, code_verifier);
+
+  const scope = ["user:read", "chat:write"].join(" ");
+  const url = new URL("https://id.kick.com/oauth2/authorize");
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", KICK_CLIENT_ID);
+  url.searchParams.set("redirect_uri", KICK_REDIRECT_URI);
+  url.searchParams.set("scope", scope);
+  url.searchParams.set("state", state);
+  url.searchParams.set("code_challenge", code_challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+
+  res.type("text/plain").send(url.toString());
 });
 
 app.get("/callback", async (req, res) => {
@@ -332,11 +361,17 @@ app.get("/callback", async (req, res) => {
 });
 
 /* ================== START ================== */
-app.listen(PORT, () => {
-  log(`kick-echo-cmd listening on :${PORT}`);
+const appStart = async () => {
+  const srv = app.listen(PORT, () => {
+    log(`kick-echo-cmd listening on :${PORT}`);
+  });
+
   if (!allowedSlugs.length) {
     log("Ustaw ALLOWED_SLUGS w .env (np. rybsonlol,drugi)");
-  } else {
-    for (const slug of allowedSlugs) ensureWs(slug);
+    return;
   }
-});
+  for (const slug of allowedSlugs) {
+    try { await ensureWs(slug); } catch {}
+  }
+};
+appStart();
