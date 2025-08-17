@@ -1,307 +1,188 @@
-import "dotenv/config";
-import express from "express";
-import bodyParser from "body-parser";
-import axios from "axios";
-import { io } from "socket.io-client";
-import crypto from "crypto";
+// server.js
+const express = require('express');
+const axios = require('axios').default;
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
-/* ================== ENV ================== */
-const {
-  PORT = 3100,
-  ALLOWED_SLUGS = "",
-  BOT_USERNAME = "",
-  ECHO_THRESHOLD = "5",
-  ECHO_COOLDOWN_SECONDS = "120",
-  IGNORE_EXACT = "!points",
-  KICK_CLIENT_ID = "",
-  KICK_CLIENT_SECRET = "",
-  KICK_REDIRECT_URI = "",
-  CHATROOM_ID_OVERRIDES = "",
-  LOG_LEVEL = "info"
-} = process.env;
+const app = express();
 
-const allowedSlugs = ALLOWED_SLUGS.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
-const ignoreExact = new Set((IGNORE_EXACT || "").toLowerCase().split(",").map(s => s.trim()).filter(Boolean));
-const echoThreshold = Math.max(2, Number(ECHO_THRESHOLD) || 5);
-const echoCooldownMs = Math.max(0, Number(ECHO_COOLDOWN_SECONDS) || 120) * 1000;
+// ===== ENV =====
+const PORT = process.env.PORT || 3100;
+const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID || '';
+const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET || '';
+const KICK_REDIRECT_URI = process.env.KICK_REDIRECT_URI || ''; // np. https://fajna-apka.onrender.com/callback
+const ID_BASE = process.env.KICK_ID_BASE || 'https://id.kick.com';
 
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-const JSON_HEADERS = { "User-Agent": UA, "Accept": "application/json, text/plain, */*", "Referer": "https://kick.com/" };
-const HTML_HEADERS = { "User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Referer": "https://kick.com/" };
-const log = (...a) => { if (LOG_LEVEL !== "silent") console.log(...a); };
+// ===== PROSTA "PAMIĘĆ" =====
+const DATA_DIR = process.env.DATA_DIR || '.';
+const TOKENS_PATH = path.join(DATA_DIR, 'tokens.json');
+const PKCE_PATH = path.join(DATA_DIR, 'pkce.json');
 
-/* ================== Tokeny ================== */
-let TOKENS = {
-  access_token: process.env.KICK_ACCESS_TOKEN || "",
-  refresh_token: process.env.KICK_REFRESH_TOKEN || "",
-  expires_at: 0
-};
-function setTokens(t) {
-  if (t?.access_token) TOKENS.access_token = t.access_token;
-  if (t?.refresh_token) TOKENS.refresh_token = t.refresh_token;
-  if (t?.expires_in) TOKENS.expires_at = Date.now() + t.expires_in * 1000 - 10_000;
+function saveJSON(file, obj) {
+  fs.writeFileSync(file, JSON.stringify(obj, null, 2), 'utf-8');
 }
-async function ensureToken() {
-  if (TOKENS.access_token && Date.now() < TOKENS.expires_at) return TOKENS.access_token;
-  if (!TOKENS.refresh_token) throw new Error("Brak refresh_token – uruchom /auth/start i dokończ logowanie.");
-  const url = "https://id.kick.com/oauth2/token";
-  const params = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: TOKENS.refresh_token,
+function loadJSON(file) {
+  if (!fs.existsSync(file)) return null;
+  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); }
+  catch { return null; }
+}
+
+// ===== POMOCNICZE =====
+function b64url(input) {
+  return input.toString('base64')
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+function makePKCE() {
+  const verifier = b64url(crypto.randomBytes(32));
+  const challenge = b64url(
+    crypto.createHash('sha256').update(verifier).digest()
+  );
+  return { verifier, challenge };
+}
+function urlSearch(params) {
+  return new URLSearchParams(params);
+}
+
+// ===== ROUTES =====
+app.get('/health', (_, res) => res.type('text').send('ok'));
+
+// Generuje URL (pomocniczo – tylko podgląd)
+app.get('/auth/url', (req, res) => {
+  if (!KICK_CLIENT_ID || !KICK_REDIRECT_URI) {
+    return res.status(500).send('Brak KICK_CLIENT_ID lub KICK_REDIRECT_URI');
+  }
+  const { verifier, challenge } = makePKCE();
+  const state = 'dbg' + Date.now();
+
+  // Zapisujemy, aby /callback miał verifier po powrocie
+  saveJSON(PKCE_PATH, { verifier, state, created_at: Date.now() });
+
+  const scope = [
+    'user:read',
+    'chat:write',
+    'offline_access',           // konieczne, by dostać refresh_token
+    'webhook:subscribe'
+  ].join(' ');
+
+  const authUrl = new URL(ID_BASE + '/oauth2/authorize');
+  authUrl.search = urlSearch({
+    response_type: 'code',
+    client_id: KICK_CLIENT_ID,
+    redirect_uri: KICK_REDIRECT_URI,
+    scope,
+    state,
+    code_challenge: challenge,
+    code_challenge_method: 'S256'
+  }).toString();
+
+  res.type('text').send(authUrl.toString());
+});
+
+// Autoryzacja – od razu przekierowuje na Kick
+app.get('/auth/start', (req, res) => {
+  if (!KICK_CLIENT_ID || !KICK_REDIRECT_URI) {
+    return res.status(500).send('Brak KICK_CLIENT_ID lub KICK_REDIRECT_URI');
+  }
+  const { verifier, challenge } = makePKCE();
+  const state = 'dbg' + Date.now();
+  saveJSON(PKCE_PATH, { verifier, state, created_at: Date.now() });
+
+  const scope = [
+    'user:read',
+    'chat:write',
+    'offline_access',
+    'webhook:subscribe'
+  ].join(' ');
+
+  const authUrl = new URL(ID_BASE + '/oauth2/authorize');
+  authUrl.search = urlSearch({
+    response_type: 'code',
+    client_id: KICK_CLIENT_ID,
+    redirect_uri: KICK_REDIRECT_URI,
+    scope,
+    state,
+    code_challenge: challenge,
+    code_challenge_method: 'S256'
+  }).toString();
+
+  res.redirect(authUrl.toString());
+});
+
+// Callback – wymiana code -> token (z fallbackiem /oauth2/token i /oauth/token)
+app.get('/callback', async (req, res) => {
+  const { code, state } = req.query || {};
+  if (!code) return res.status(400).send('Brak "code" w callback');
+
+  const pkce = loadJSON(PKCE_PATH);
+  if (!pkce || !pkce.verifier) {
+    return res.status(400).send('Brak code_verifier – uruchom /auth/start');
+  }
+  if (state && pkce.state && state !== pkce.state) {
+    return res.status(400).send('Nieprawidłowy state');
+  }
+
+  const body = urlSearch({
+    grant_type: 'authorization_code',
+    code: code.toString(),
+    redirect_uri: KICK_REDIRECT_URI,
     client_id: KICK_CLIENT_ID,
     client_secret: KICK_CLIENT_SECRET,
-    redirect_uri: KICK_REDIRECT_URI
-  });
-  const { data } = await axios.post(url, params, { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 });
-  setTokens(data);
-  return TOKENS.access_token;
-}
-
-/* ================== Utils ================== */
-function normalizeRaw(s) { return String(s || "").trim().toLowerCase(); }
-function isCommand(s) { return String(s || "").trim().startsWith("!"); }
-
-/* ================== Kick API helpers ================== */
-const chatroomOverrideMap = String(CHATROOM_ID_OVERRIDES || "")
-  .split(",").map(s => s.trim()).filter(Boolean)
-  .reduce((acc, pair) => {
-    const [slug, id] = pair.split(":").map(x => (x || "").trim());
-    if (slug && /^\d+$/.test(id)) acc[slug.toLowerCase()] = Number(id);
-    return acc;
-  }, {});
-
-async function getChannelMeta(slug) {
-  try {
-    const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
-      timeout: 12000, headers: JSON_HEADERS
-    });
-    const chatroom_id = data?.chatroom?.id ?? data?.data?.chatroom?.id ?? null;
-    const broadcaster_user_id = data?.id ?? data?.user_id ?? data?.user?.id ?? data?.data?.id ?? null;
-    if (chatroom_id && broadcaster_user_id) return { chatroom_id, broadcaster_user_id };
-  } catch {}
-  try {
-    const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}/chatroom`, {
-      timeout: 12000, headers: JSON_HEADERS
-    });
-    const chatroom_id = data?.id ?? null;
-    const d2 = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
-      timeout: 12000, headers: JSON_HEADERS
-    }).then(r => r.data).catch(() => null);
-    const broadcaster_user_id = d2?.id ?? d2?.user_id ?? d2?.user?.id ?? d2?.data?.id ?? null;
-    if (chatroom_id && broadcaster_user_id) return { chatroom_id, broadcaster_user_id };
-  } catch {}
-  try {
-    const { data: html } = await axios.get(`https://kick.com/${encodeURIComponent(slug)}`, {
-      timeout: 12000, headers: HTML_HEADERS, responseType: "text"
-    });
-    let m = /"chatroom"\s*:\s*\{\s*"id"\s*:\s*(\d+)/.exec(html) || /"chatroom_id"\s*:\s*(\d+)/.exec(html);
-    const chatroom_id = m ? Number(m[1]) : null;
-    let u = /"user_id"\s*:\s*(\d+)/.exec(html) || /"id"\s*:\s*(\d+)/.exec(html);
-    const broadcaster_user_id = u ? Number(u[1]) : null;
-    if (chatroom_id && broadcaster_user_id) return { chatroom_id, broadcaster_user_id };
-  } catch {}
-  if (chatroomOverrideMap[slug]) {
-    try {
-      const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
-        timeout: 12000, headers: JSON_HEADERS
-      });
-      const broadcaster_user_id = data?.id ?? data?.user_id ?? data?.user?.id ?? data?.data?.id ?? null;
-      if (broadcaster_user_id) return { chatroom_id: chatroomOverrideMap[slug], broadcaster_user_id };
-    } catch {}
-  }
-  return { chatroom_id: null, broadcaster_user_id: null };
-}
-
-async function sendChatMessage(broadcaster_user_id, content) {
-  const token = await ensureToken();
-  await axios.post("https://kick.com/api/v2/chats/send", { broadcaster_user_id, content }, {
-    headers: { Authorization: `Bearer ${token}` }, timeout: 15000
-  });
-}
-
-/* ================== Echo-detekcja ================== */
-const wsBySlug = new Map();
-const metaBySlug = new Map();
-const lastCmdsBySlug = new Map();
-const lastEchoAt = new Map();
-
-function pushCmd(slug, item, limit = 12) {
-  const arr = lastCmdsBySlug.get(slug) || [];
-  arr.push(item);
-  if (arr.length > limit) arr.splice(0, arr.length - limit);
-  lastCmdsBySlug.set(slug, arr);
-}
-function shouldEcho(slug) {
-  const arr = lastCmdsBySlug.get(slug) || [];
-  if (arr.length < echoThreshold) return null;
-  const tail = arr.slice(-echoThreshold);
-  const firstNorm = tail[0].norm;
-  if (!tail.every(x => x.norm === firstNorm)) return null;
-  const rawToEcho = tail[tail.length - 1].raw;
-  const cmdNorm = firstNorm;
-  const key = `${slug}|${cmdNorm}`;
-  const last = lastEchoAt.get(key) || 0;
-  if (Date.now() - last < echoCooldownMs) return null;
-  if (ignoreExact.has(cmdNorm)) return null;
-  return { rawToEcho, key };
-}
-
-/* ================== WS ================== */
-async function ensureWs(slug) {
-  if (wsBySlug.has(slug)) return;
-  const meta = await getChannelMeta(slug);
-  if (!meta.chatroom_id || !meta.broadcaster_user_id) {
-    log(`[warn] Brak meta dla ${slug}. Ustaw CHATROOM_ID_OVERRIDES albo sprawdź slug.`);
-    setTimeout(() => ensureWs(slug), 60000);
-    return;
-  }
-  metaBySlug.set(slug, meta);
-
-  const socket = io("https://chat.kick.com", {
-    transports: ["websocket"],
-    reconnection: true,
-    reconnectionDelayMax: 15000,
-    forceNew: true
+    code_verifier: pkce.verifier
   });
 
-  socket.on("connect", () => {
-    try { socket.emit("SUBSCRIBE", { room: `chatrooms:${meta.chatroom_id}` }); } catch {}
-    log(`WS connected for ${slug} (chatrooms:${meta.chatroom_id})`);
-  });
-
-  const handler = (payload) => {
-    const username =
-      payload?.username || payload?.user?.username || payload?.sender?.username ||
-      payload?.author?.username || payload?.message?.sender?.username || "";
-
-    if (BOT_USERNAME && username && username.toLowerCase() === BOT_USERNAME.toLowerCase()) return;
-
-    const raw = String(payload?.content ?? payload?.message?.content ?? "").trim();
-    if (!raw) return;
-    if (!isCommand(raw)) return;
-
-    const norm = normalizeRaw(raw);
-    pushCmd(slug, { raw, norm, user: username || "unknown", t: Date.now() });
-
-    const decision = shouldEcho(slug);
-    if (decision) {
-      const { rawToEcho, key } = decision;
-      const meta = metaBySlug.get(slug);
-      if (!meta?.broadcaster_user_id) return;
-      sendChatMessage(meta.broadcaster_user_id, rawToEcho)
-        .then(() => { lastEchoAt.set(key, Date.now()); log(`[ECHO] ${slug} → "${rawToEcho}"`); })
-        .catch(e => { const st = e?.response?.status; log("Echo send error", st || "", e?.response?.data || e.message); });
-    }
+  const headers = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Accept': 'application/json'
   };
 
-  socket.on("message", handler);
-  socket.on("chat_message", handler);
-  socket.on("disconnect", () => log(`WS disconnected for ${slug}`));
-  wsBySlug.set(slug, socket);
-}
+  const tokenPaths = ['/oauth2/token', '/oauth/token']; // fallback
+  let tokenResp = null, lastErr = null;
 
-/* ================== HTTP ================== */
-const app = express();
-app.use(bodyParser.json());
-
-app.get("/health", (_req, res) => res.send("ok"));
-app.get("/stats", (_req, res) => {
-  const out = {};
-  for (const slug of allowedSlugs) {
-    const meta = metaBySlug.get(slug) || {};
-    const arr = (lastCmdsBySlug.get(slug) || []).slice(-10);
-    out[slug] = { chatroom_id: meta.chatroom_id || null, broadcaster_user_id: meta.broadcaster_user_id || null, last_commands: arr };
+  for (const p of tokenPaths) {
+    try {
+      tokenResp = await axios.post(ID_BASE + p, body, { headers, timeout: 15000 });
+      if (tokenResp?.data?.access_token) break;
+    } catch (e) {
+      lastErr = e;
+      if (e?.response?.status === 404) continue; // próbuj następny path
+      // dla innych błędów: przerwij
+      break;
+    }
   }
-  res.json(out);
-});
 
-/* ===== PKCE helpers ===== */
-const pkceByState = new Map();
-function sha256(buffer) { return crypto.createHash("sha256").update(buffer).digest(); }
-function base64urlencode(b) { return b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
-function genPKCE() {
-  const code_verifier = base64urlencode(crypto.randomBytes(32));
-  const code_challenge = base64urlencode(sha256(code_verifier));
-  return { code_verifier, code_challenge };
-}
-
-/* ===== OAuth: użyj %20 zamiast + w scope ===== */
-function buildAuthorizeUrl({ client_id, redirect_uri, scope, state, code_challenge }) {
-  // ręczne budowanie, żeby spacje były %20
-  const params =
-    `response_type=code` +
-    `&client_id=${encodeURIComponent(client_id)}` +
-    `&redirect_uri=${encodeURIComponent(redirect_uri)}` +
-    `&scope=${encodeURIComponent(scope)}` + // -> spacje jako %20
-    `&state=${encodeURIComponent(state)}` +
-    `&code_challenge=${encodeURIComponent(code_challenge)}` +
-    `&code_challenge_method=S256`;
-  return `https://id.kick.com/oauth2/authorize?${params}`;
-}
-
-app.get("/auth/start", (_req, res) => {
-  if (!KICK_CLIENT_ID || !KICK_REDIRECT_URI) return res.status(500).send("Missing OAuth envs");
-  const { code_verifier, code_challenge } = genPKCE();
-  const state = crypto.randomBytes(8).toString("hex");
-  pkceByState.set(state, code_verifier);
-
-  const scope = "user:read chat:write"; // jeśli potrzebujesz więcej, dodaj tu np. " channel:read"
-  const url = buildAuthorizeUrl({
-    client_id: KICK_CLIENT_ID,
-    redirect_uri: KICK_REDIRECT_URI,
-    scope,
-    state,
-    code_challenge
-  });
-  res.redirect(url);
-});
-
-// diagnostycznie – pokaż dokładny link
-app.get("/auth/url", (_req, res) => {
-  if (!KICK_CLIENT_ID || !KICK_REDIRECT_URI) return res.status(500).send("Brak KICK_CLIENT_ID/KICK_REDIRECT_URI");
-  const { code_verifier, code_challenge } = genPKCE();
-  const state = "dbg" + Date.now();
-  pkceByState.set(state, code_verifier);
-
-  const scope = "user:read chat:write";
-  const url = buildAuthorizeUrl({
-    client_id: KICK_CLIENT_ID,
-    redirect_uri: KICK_REDIRECT_URI,
-    scope,
-    state,
-    code_challenge
-  });
-  res.type("text/plain").send(url);
-});
-
-app.get("/callback", async (req, res) => {
-  try {
-    const { code, state } = req.query;
-    if (!code || !state) return res.status(400).send("Brak code/state (uruchom /auth/start).");
-    const code_verifier = pkceByState.get(String(state));
-    if (!code_verifier) return res.status(400).send("Brak code_verifier (wygaśnięty state, uruchom /auth/start ponownie).");
-
-    const tokenUrl = "https://id.kick.com/oauth2/token";
-    const params = new URLSearchParams({
-      grant_type: "authorization_code",
-      code: String(code),
-      code_verifier,
-      client_id: KICK_CLIENT_ID,
-      client_secret: KICK_CLIENT_SECRET,
-      redirect_uri: KICK_REDIRECT_URI
-    });
-    const { data } = await axios.post(tokenUrl, params, { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 });
-    setTokens(data);
-    return res.send("Tokeny zapisane ✔ – możesz zamknąć okno.");
-  } catch (e) {
-    return res.status(400).send(`Błąd callback: ${e?.response?.status || ""} ${e?.response?.data ? JSON.stringify(e.response.data) : e.message}`);
+  if (!tokenResp || !tokenResp.data || !tokenResp.data.access_token) {
+    const status = lastErr?.response?.status || 'unknown';
+    const msg = lastErr?.response?.data || lastErr?.message || 'token exchange failed';
+    return res
+      .status(500)
+      .type('text')
+      .send(`Błąd callback (token): ${status} ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
   }
+
+  // Zapis tokenów
+  const saved = {
+    obtained_at: Date.now(),
+    ...tokenResp.data
+  };
+  saveJSON(TOKENS_PATH, saved);
+
+  res.type('text').send('OK – tokeny zapisane');
 });
 
-/* ================== START ================== */
-const appStart = async () => {
-  app.listen(PORT, () => log(`kick-echo-cmd listening on :${PORT}`));
-  if (!allowedSlugs.length) { log("Ustaw ALLOWED_SLUGS w .env (np. rybsonlol,drugi)"); return; }
-  for (const slug of allowedSlugs) { try { await ensureWs(slug); } catch {} }
-};
-appStart();
+// Prosty podgląd tokenów (do szybkiej weryfikacji)
+app.get('/tokens', (req, res) => {
+  const t = loadJSON(TOKENS_PATH);
+  if (!t) return res.status(404).send('Brak zapisanych tokenów');
+  res.json({
+    has_access_token: Boolean(t.access_token),
+    has_refresh_token: Boolean(t.refresh_token),
+    token_type: t.token_type || null,
+    expires_in: t.expires_in || null,
+    obtained_at: t.obtained_at || null
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`kick-echo auth helper listening on :${PORT}`);
+});
