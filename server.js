@@ -1,352 +1,307 @@
-// server.js  (ESM)
-// Node 18+ / package.json musi mieć:  "type": "module"
+// ---------- deps ----------
+const express = require('express');
+const axios = require('axios');
+const crypto = require('crypto');
+const qs = require('querystring');
 
-import express from 'express';
-import crypto from 'crypto';
-import axios from 'axios';
-import fs from 'fs/promises';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-// ---------------------------
-// Konfiguracja z ENV + defaulty
-// ---------------------------
-const PORT = process.env.PORT || 3100;
-
-const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID || '';
-const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET || ''; // opcjonalny (PKCE działa i bez)
-const KICK_REDIRECT_URI =
-  process.env.KICK_REDIRECT_URI || 'http://localhost:3100/oauth/callback';
-
-const AUTH_URL = process.env.AUTH_URL || 'https://id.kick.com/oauth/authorize';
-const TOKEN_URL = process.env.TOKEN_URL || 'https://id.kick.com/oauth/token';
-const KICK_API_BASE = process.env.KICK_API_BASE || 'https://kick.com/api/v2';
-
-// dozwolone slugi (po przecinku/spacji/nowej linii)
-const ALLOWED_SLUGS = (process.env.ALLOWED_SLUGS || '')
-  .split(/[,\s]+/)
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// overrides w formacie: "slug1:123,slug2:456" lub po liniach
-const CHATROOM_ID_OVERRIDES = parseOverrides(
-  process.env.CHATROOM_ID_OVERRIDES || ''
-);
-
-function parseOverrides(str) {
-  const map = new Map();
-  (str || '')
-    .split(/[\n,]+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .forEach((pair) => {
-      const [slug, id] = pair.split(':').map((x) => x.trim());
-      if (slug && id) map.set(slug, id);
-    });
-  return map;
-}
-
-// ---------------------------
-// Prosty storage tokenów
-// (in-memory + plik tymczasowy w katalogu roboczym)
-// ---------------------------
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const TOKENS_PATH = path.join(__dirname, '.tokens.json');
-
-let tokens = null; // { access_token, refresh_token, token_type, expires_in, obtained_at, scope }
-
-async function loadTokens() {
-  try {
-    const raw = await fs.readFile(TOKENS_PATH, 'utf8');
-    tokens = JSON.parse(raw);
-  } catch {
-    tokens = null;
-  }
-}
-
-async function saveTokens(obj) {
-  tokens = {
-    ...obj,
-    obtained_at: Date.now(),
-  };
-  try {
-    await fs.writeFile(TOKENS_PATH, JSON.stringify(tokens), 'utf8');
-  } catch {
-    // brak uprawnień do zapisu? trudno – zostają w pamięci
-  }
-}
-
-function tokenExpiresSoon() {
-  if (!tokens?.access_token || !tokens?.expires_in || !tokens?.obtained_at) {
-    return true;
-  }
-  const expiresAt = tokens.obtained_at + (tokens.expires_in - 60) * 1000; // bufor 60s
-  return Date.now() >= expiresAt;
-}
-
-// ---------------------------
-// PKCE utils
-// ---------------------------
-function base64url(input) {
-  return Buffer.from(input)
-    .toString('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-}
-function genVerifier() {
-  return base64url(crypto.randomBytes(32));
-}
-function challengeS256(verifier) {
-  const hash = crypto.createHash('sha256').update(verifier).digest();
-  return base64url(hash);
-}
-
-// Trzymamy aktualny verifier dla trwającej autoryzacji
-let currentCodeVerifier = null;
-
-// ---------------------------
-// Express app
-// ---------------------------
+// ---------- app ----------
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: true }));
 
-// prosty UA do wywołań na kick.com
-const http = axios.create({
-  headers: {
-    'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
-    Accept: 'application/json, text/plain, */*',
-    Origin: 'https://kick.com',
-    Referer: 'https://kick.com/',
-  },
-  timeout: 15000,
-});
+const PORT = process.env.PORT || 3100;
 
-// ---------------------------
-// Health
-// ---------------------------
-app.get('/health', (_req, res) => res.type('text').send('ok'));
+// ---------- env ----------
+const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID || '';
+const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET || '';
+const KICK_REDIRECT_URI =
+  process.env.KICK_REDIRECT_URI || 'https://YOUR-RENDER-URL/oauth/callback';
 
-// ---------------------------
-// OAuth – start
-// ---------------------------
-app.get('/oauth/start', (req, res) => {
-  if (!KICK_CLIENT_ID || !KICK_REDIRECT_URI) {
-    return res
-      .status(500)
-      .send('Brak KICK_CLIENT_ID lub KICK_REDIRECT_URI w ENV');
+// OAuth endpoints (v1, bez “2”)
+const AUTH_BASE = 'https://id.kick.com/oauth';
+const AUTH_URL = `${AUTH_BASE}/authorize`;
+const TOKEN_URL = `${AUTH_BASE}/token`;
+
+// dozwolone kanały (po przecinku). używaj “holly-s”
+const ALLOWED_SLUGS = (process.env.ALLOWED_SLUGS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// override: "holly-s:12345,inna-nazwa:6789" akceptuje też holly_s
+const CHATROOM_ID_OVERRIDES = (() => {
+  const raw = process.env.CHATROOM_ID_OVERRIDES || '';
+  const map = new Map();
+  raw.split(',').map(x => x.trim()).filter(Boolean).forEach(pair => {
+    const [k, v] = pair.split(':').map(s => s.trim());
+    if (!k || !v) return;
+    const hyph = k.replace(/_/g, '-').toLowerCase();
+    const undr = k.replace(/-/g, '_').toLowerCase();
+    map.set(hyph, v);
+    map.set(undr, v);
+  });
+  return map;
+})();
+
+// pamięć na tokeny (prosto – w RAM)
+let TOKENS = {
+  access_token: null,
+  refresh_token: null,
+  token_type: 'Bearer',
+  scope: null,
+  obtained_at: 0,
+  expires_in: 0
+};
+
+// ---------- utils ----------
+const nowSec = () => Math.floor(Date.now() / 1000);
+
+function normalizeSlug(s) {
+  if (!s) return '';
+  return s.toLowerCase().trim();
+}
+function hyphenSlug(s) {
+  return normalizeSlug(s).replace(/_/g, '-');
+}
+function underscoreSlug(s) {
+  return normalizeSlug(s).replace(/-/g, '_');
+}
+
+function haveValidAccessToken() {
+  if (!TOKENS.access_token || !TOKENS.expires_in || !TOKENS.obtained_at) return false;
+  // odświeżamy 60s przed wygaśnięciem
+  return nowSec() < (TOKENS.obtained_at + TOKENS.expires_in - 60);
+}
+
+async function refreshIfNeeded() {
+  if (haveValidAccessToken()) return;
+  if (!TOKENS.refresh_token) throw new Error('Brak refresh_token – uruchom /oauth/start');
+  const body = {
+    grant_type: 'refresh_token',
+    refresh_token: TOKENS.refresh_token,
+    client_id: KICK_CLIENT_ID,
+    client_secret: KICK_CLIENT_SECRET,
+    redirect_uri: KICK_REDIRECT_URI
+  };
+  const { data } = await axios.post(TOKEN_URL, qs.stringify(body), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 15000
+  });
+  TOKENS.access_token = data.access_token;
+  TOKENS.refresh_token = data.refresh_token || TOKENS.refresh_token;
+  TOKENS.token_type = data.token_type || 'Bearer';
+  TOKENS.scope = data.scope || TOKENS.scope;
+  TOKENS.expires_in = data.expires_in || 7200;
+  TOKENS.obtained_at = nowSec();
+}
+
+// GET /api/v2/channels/{slug} (MUST be GET)
+async function fetchChannelMetaV2(slugHyphen) {
+  const url = `https://kick.com/api/v2/channels/${slugHyphen}`;
+  const { data } = await axios.get(url, { timeout: 12000 });
+  // popularny układ: { chatroom: { id }, user: {...}, ... }
+  const chatroomId =
+    data?.chatroom?.id ||
+    data?.chatroom_id ||
+    null;
+  return { chatroomId, raw: data };
+}
+
+// HTML fallback: wyciągamy chatroom_id ze strony kanału
+async function fetchChannelMetaFromHTML(slugHyphen) {
+  const url = `https://kick.com/${slugHyphen}`;
+  const { data: html } = await axios.get(url, { timeout: 12000 });
+  // spróbuj kilka regexów bo Kick często zmienia strukturę
+  const regexes = [
+    /"chatroom"\s*:\s*\{[^}]*"id"\s*:\s*(\d+)/i,
+    /data-chatroom-id\s*=\s*"(\d+)"/i,
+    /"chatroom_id"\s*:\s*(\d+)/i
+  ];
+  for (const re of regexes) {
+    const m = html.match(re);
+    if (m && m[1]) {
+      return { chatroomId: m[1], raw: null };
+    }
   }
-  const verifier = genVerifier();
-  const challenge = challengeS256(verifier);
-  currentCodeVerifier = verifier;
+  return { chatroomId: null, raw: null };
+}
 
-  const scope = encodeURIComponent('user:read chat:write');
-  const url =
-    `${AUTH_URL}?response_type=code` +
-    `&client_id=${encodeURIComponent(KICK_CLIENT_ID)}` +
-    `&redirect_uri=${encodeURIComponent(KICK_REDIRECT_URI)}` +
-    `&scope=${scope}` +
-    `&code_challenge=${encodeURIComponent(challenge)}` +
-    `&code_challenge_method=S256` +
-    `&state=dbg${Date.now()}`;
+async function resolveChatroomId(slugInput) {
+  const hyph = hyphenSlug(slugInput);
+  const undr = underscoreSlug(slugInput);
 
-  res.redirect(url);
+  // override?
+  if (CHATROOM_ID_OVERRIDES.has(hyph)) return CHATROOM_ID_OVERRIDES.get(hyph);
+  if (CHATROOM_ID_OVERRIDES.has(undr)) return CHATROOM_ID_OVERRIDES.get(undr);
+
+  // v2 (GET!)
+  try {
+    const { chatroomId } = await fetchChannelMetaV2(hyph);
+    if (chatroomId) return String(chatroomId);
+  } catch (e) {
+    // 403/405/… – spróbuj HTML
+  }
+
+  // HTML fallback
+  try {
+    const { chatroomId } = await fetchChannelMetaFromHTML(hyph);
+    if (chatroomId) return String(chatroomId);
+  } catch (e) { /* ignore */ }
+
+  throw new Error(`Nie mogę znaleźć chatroom_id dla sluga "${slugInput}". Ustaw CHATROOM_ID_OVERRIDES.`);
+}
+
+// faktyczna wysyłka wiadomości
+async function sendChatMessage({ slug, text }) {
+  if (!slug || !text) throw new Error('Brak slug albo text');
+  const normSlug = hyphenSlug(slug);
+
+  if (ALLOWED_SLUGS.length && !ALLOWED_SLUGS.includes(normSlug)) {
+    throw new Error(`Slug "${slug}" nie jest dozwolony (ALLOWED_SLUGS).`);
+  }
+
+  await refreshIfNeeded();
+  const chatroomId = await resolveChatroomId(normSlug);
+
+  const url = 'https://kick.com/api/v2/messages/send';
+  const payload = {
+    chatroom_id: chatroomId,
+    content: text
+  };
+
+  const { data } = await axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${TOKENS.access_token}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: 15000,
+    // niektóre regiony potrzebują user-agent
+    validateStatus: s => s >= 200 && s < 500
+  });
+
+  if (data?.message?.id || data?.id) {
+    return { ok: true, chatroom_id: chatroomId, message_id: data?.message?.id || data?.id || null };
+  }
+
+  // 4xx z treścią (np. 403/405) – pokaż co przyszło
+  throw new Error(
+    data?.message
+      ? `Kick API error: ${data.message}`
+      : `Kick API rejected the request (sprawdź scope i token).`
+  );
+}
+
+// ---------- routes ----------
+app.get('/health', (_, res) => res.type('text/plain').send('ok'));
+
+// —— OAuth PKCE (prosty) ——
+function makeVerifier() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+function makeChallenge(verifier) {
+  return crypto.createHash('sha256').update(verifier).digest('base64url');
+}
+let PKCE = { verifier: null, state: null };
+
+app.get('/oauth/start', (req, res) => {
+  const state = 'dbg' + Date.now();
+  const verifier = makeVerifier();
+  const challenge = makeChallenge(verifier);
+  PKCE = { verifier, state };
+
+  const params = qs.stringify({
+    response_type: 'code',
+    client_id: KICK_CLIENT_ID,
+    redirect_uri: KICK_REDIRECT_URI,
+    scope: 'user:read chat:write',
+    state,
+    code_challenge: challenge,
+    code_challenge_method: 'S256'
+  });
+
+  res.redirect(`${AUTH_URL}?${params}`);
 });
 
-// pomocniczo – wypisuje URL autoryzacji (bez redirectu)
-app.get('/oauth/url', (_req, res) => {
-  const verifier = genVerifier();
-  const challenge = challengeS256(verifier);
-  currentCodeVerifier = verifier;
-
-  const scope = encodeURIComponent('user:read chat:write');
-  const url =
-    `${AUTH_URL}?response_type=code` +
-    `&client_id=${encodeURIComponent(KICK_CLIENT_ID)}` +
-    `&redirect_uri=${encodeURIComponent(KICK_REDIRECT_URI)}` +
-    `&scope=${scope}` +
-    `&code_challenge=${encodeURIComponent(challenge)}` +
-    `&code_challenge_method=S256` +
-    `&state=dbg${Date.now()}`;
-
-  res.type('text').send(url);
-});
-
-// ---------------------------
-// OAuth – callback (wymiana code -> tokeny)
-// ---------------------------
 app.get('/oauth/callback', async (req, res) => {
   try {
-    const { code } = req.query;
-    if (!code) return res.status(400).send('Brak ?code=');
+    const { code, state } = req.query;
+    if (!code) throw new Error('Brak code w callbacku');
+    if (!state || state !== PKCE.state) throw new Error('Błędny state');
 
-    if (!currentCodeVerifier) {
-      // np. restart – nadal da się wymienić jeśli backend pamięta verifier;
-      // gdy go brak – poproś o ponowny /oauth/start
-      return res
-        .status(400)
-        .send('Brak code_verifier (uruchom ponownie /oauth/start).');
-    }
+    const body = {
+      grant_type: 'authorization_code',
+      code,
+      code_verifier: PKCE.verifier,
+      client_id: KICK_CLIENT_ID,
+      client_secret: KICK_CLIENT_SECRET,
+      redirect_uri: KICK_REDIRECT_URI
+    };
 
-    const form = new URLSearchParams();
-    form.set('grant_type', 'authorization_code');
-    form.set('code', String(code));
-    form.set('redirect_uri', KICK_REDIRECT_URI);
-    form.set('client_id', KICK_CLIENT_ID);
-    form.set('code_verifier', currentCodeVerifier);
-    if (KICK_CLIENT_SECRET) form.set('client_secret', KICK_CLIENT_SECRET);
-
-    const r = await axios.post(TOKEN_URL, form.toString(), {
+    const { data } = await axios.post(TOKEN_URL, qs.stringify(body), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: 15000,
+      timeout: 15000
     });
 
-    await saveTokens(r.data);
-    currentCodeVerifier = null;
+    TOKENS.access_token = data.access_token;
+    TOKENS.refresh_token = data.refresh_token;
+    TOKENS.token_type = data.token_type || 'Bearer';
+    TOKENS.scope = data.scope || 'user:read chat:write';
+    TOKENS.expires_in = data.expires_in || 7200;
+    TOKENS.obtained_at = nowSec();
 
     res
       .status(200)
-      .type('text')
-      .send('Tokeny zapisane ✅. Możesz sprawdzić /tokens albo wysłać /chat/test');
-  } catch (err) {
-    const msg =
-      err?.response?.status === 404
-        ? 'Błąd callback: 404'
-        : `Błąd callback: ${err?.response?.status || ''} ${err.message}`;
-    res.status(500).type('text').send(msg);
+      .type('text/plain')
+      .send('Tokeny zapisane ✅. Wejdź na /tokens albo /chat/test');
+  } catch (e) {
+    res
+      .status(400)
+      .type('text/plain')
+      .send(`Błąd callback: ${e.message || e}`);
   }
 });
 
-// Podgląd co mamy (bez wycieku sekretów)
-app.get('/tokens', async (_req, res) => {
-  await loadTokens();
-  const info = tokens
-    ? {
-        has_access_token: !!tokens.access_token,
-        has_refresh_token: !!tokens.refresh_token,
-        token_type: tokens.token_type,
-        expires_in: tokens.expires_in,
-        obtained_at: tokens.obtained_at,
-        scope: tokens.scope,
-      }
-    : { has_access_token: false, has_refresh_token: false };
-  res.json(info);
+app.get('/tokens', (req, res) => {
+  res.json({
+    has_access_token: !!TOKENS.access_token,
+    has_refresh_token: !!TOKENS.refresh_token,
+    token_type: TOKENS.token_type,
+    expires_in: TOKENS.expires_in,
+    obtained_at: TOKENS.obtained_at,
+    scope: TOKENS.scope
+  });
 });
 
-// ---------------------------
-// Odświeżanie tokenu przy potrzebie
-// ---------------------------
-async function ensureAccessToken() {
-  if (!tokens) await loadTokens();
-  if (!tokens?.access_token) {
-    throw new Error('Brak access_token – wykonaj /oauth/start');
-  }
-  if (!tokenExpiresSoon()) return tokens.access_token;
-
-  if (!tokens.refresh_token) {
-    throw new Error('Brak refresh_token – wykonaj /oauth/start');
-  }
-
-  const form = new URLSearchParams();
-  form.set('grant_type', 'refresh_token');
-  form.set('refresh_token', tokens.refresh_token);
-  form.set('client_id', KICK_CLIENT_ID);
-  if (KICK_CLIENT_SECRET) form.set('client_secret', KICK_CLIENT_SECRET);
-
-  const r = await axios.post(TOKEN_URL, form.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    timeout: 15000,
-  });
-  await saveTokens({ ...tokens, ...r.data });
-  return tokens.access_token;
-}
-
-// ---------------------------
-// Chatroom ID resolver
-// ---------------------------
-async function resolveChatroomId(slug) {
-  // override?
-  if (CHATROOM_ID_OVERRIDES.has(slug)) {
-    return CHATROOM_ID_OVERRIDES.get(slug);
-  }
-
-  // z API v2
-  const url = `${KICK_API_BASE}/channels/${encodeURIComponent(slug)}`;
-  const r = await http.get(url);
-  // oczekiwany kształt: { data: { chatroom: { id: ... } } } albo { chatroom: { id: ... } }
-  const body = r.data || {};
-  const id =
-    body?.chatroom?.id ||
-    body?.data?.chatroom?.id ||
-    body?.channel?.chatroom?.id;
-  if (!id) {
-    throw new Error('Nie udało się odczytać chatroom_id z API');
-  }
-  return String(id);
-}
-
-// ---------------------------
-// Wysyłanie wiadomości
-// ---------------------------
-async function sendMessageToChat({ slug, text }) {
-  if (!slug || !text) throw new Error('slug i text są wymagane');
-  // kontrola sluga – musi być w ALLOWED_SLUGS jeśli lista ustawiona
-  if (ALLOWED_SLUGS.length && !ALLOWED_SLUGS.includes(slug)) {
-    throw new Error(`Slug ${slug} nie jest dozwolony (ALLOWED_SLUGS)`);
-  }
-
-  const accessToken = await ensureAccessToken();
-  const chatroomId = await resolveChatroomId(slug);
-
-  const payload = { chatroom_id: chatroomId, content: text };
-  const r = await http.post(`${KICK_API_BASE}/messages/send`, payload, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  return r.data || { ok: true };
-}
-
-// ---------------------------
-// /chat/test  – GET i POST
-// GET  /chat/test?slug=holly-s&text=siema
-// POST /chat/test   {"slug":"holly-s","text":"siema"}
-// ---------------------------
-async function handleChatTest(slug, text, res) {
+// —— chat/test ——
+// GET: /chat/test?slug=holly-s&text=siema
+app.get('/chat/test', async (req, res) => {
   try {
-    const data = await sendMessageToChat({ slug, text });
-    res.json({ ok: true, result: data });
-  } catch (err) {
-    const status = err?.response?.status || 500;
-    const details = err?.response?.data || err.message;
-    res.status(status).json({ ok: false, error: details });
+    const { slug, text } = req.query;
+    const out = await sendChatMessage({ slug, text });
+    res.json(out);
+  } catch (e) {
+    res.status(200).json({ ok: false, error: e.message || String(e) });
   }
-}
-
-app.get('/chat/test', (req, res) => {
-  const { slug, text } = req.query;
-  return handleChatTest(String(slug || ''), String(text || ''), res);
 });
 
-app.post('/chat/test', (req, res) => {
-  const { slug, text } = req.body || {};
-  return handleChatTest(String(slug || ''), String(text || ''), res);
+// POST: JSON { slug, text }
+app.post('/chat/test', async (req, res) => {
+  try {
+    const { slug, text } = req.body || {};
+    const out = await sendChatMessage({ slug, text });
+    res.json(out);
+  } catch (e) {
+    res.status(200).json({ ok: false, error: e.message || String(e) });
+  }
 });
 
-// ---------------------------
-// Fallback /subscribe (na razie 200 z info – żeby nie było 404)
-// ---------------------------
-app.all('/subscribe', (_req, res) => {
-  res.json({ ok: false, error: { status: 501, message: 'Not Implemented' } });
+// safety net
+app.all('*', (req, res) => {
+  res.status(404).type('text/plain').send('Not Found');
 });
 
-// ---------------------------
-// Start
-// ---------------------------
+// ---------- start ----------
 app.listen(PORT, () => {
   console.log(`auth+bot app listening on :${PORT}`);
-  console.log(
-    `Using OAuth prefix: /oauth (authorize: ${AUTH_URL})`
-  );
+  console.log(`Using OAuth prefix: /oauth (authorize: ${AUTH_URL})`);
 });
