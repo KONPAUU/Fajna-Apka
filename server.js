@@ -1,6 +1,6 @@
-// server.js  (ESM)
-// Działa z "type":"module". Nie trzeba ruszać ENV.
-// Obsługuje równolegle /oauth/*, /auth/* i bez prefixu.
+// server.js  — ESM
+// Bot do Kick: echo tej samej !komendy po N powtórzeniach.
+// Działa z "type":"module" w package.json.
 
 import "dotenv/config";
 import express from "express";
@@ -11,53 +11,63 @@ import fs from "fs";
 import path from "path";
 import { io } from "socket.io-client";
 
-/* ---------- UA / headers "jak przeglądarka" ---------- */
+/* ---------- UA / nagłówki ---------- */
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-const JSON_HEADERS = { "User-Agent": UA, Accept: "application/json, text/plain, */*", Referer: "https://kick.com/" };
-const HTML_HEADERS = { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", Referer: "https://kick.com/" };
+const JSON_HEADERS = {
+  "User-Agent": UA,
+  Accept: "application/json, text/plain, */*",
+  Referer: "https://kick.com/",
+};
+const HTML_HEADERS = {
+  "User-Agent": UA,
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  Referer: "https://kick.com/",
+};
 
 /* ---------- ENV ---------- */
 const {
   PORT = 3100,
 
-  // OAuth / Kick
+  // OAuth Kick
   KICK_CLIENT_ID = "",
   KICK_CLIENT_SECRET = "",
-  KICK_REDIRECT_URI = "",               // zostaw jak masz; serwer i tak przyjmie też /callback i /auth/callback
+  KICK_REDIRECT_URI = "", // w Kick ustaw na https://<twoja-apka>.onrender.com/callback
   AUTH_URL = "https://id.kick.com/oauth/authorize",
   TOKEN_URL = "https://id.kick.com/oauth/token",
-  KICK_OAUTH_PREFIX = "/oauth",         // używamy, ale *dodatkowo* rejestrujemy też /auth/* i bez prefixu
+  KICK_OAUTH_PREFIX = "/oauth",
 
   // Kanały / bot
-  ALLOWED_SLUGS = "",
+  ALLOWED_SLUGS = "", // np. holly-s (lub holly_s) — serwer i tak spróbuje obie wersje
   BOT_USERNAME = "",
-  CHATROOM_ID_OVERRIDES = "",           // np. "holly-s:56494133"
+  CHATROOM_ID_OVERRIDES = "", // np. "holly-s:56494133"
   ADMIN_KEY = "",
   SUBSCRIBE_KEY = "",
 
-  // Echo (aliasy)
+  // Echo
   CMD_ECHO_ENABLED = "true",
-  CMD_ECHO_MIN_RUN,                     // preferowane, ale obsługujemy też ECHO_THRESHOLD
-  ECHO_THRESHOLD,                       // alias (jeśli ustawione)
+  CMD_ECHO_MIN_RUN,
+  ECHO_THRESHOLD,
   CMD_ECHO_COOLDOWN_SECONDS = "60",
-  IGNORE_EXACT = "",                    // alias na CMD_ECHO_EXCLUDE
   CMD_ECHO_EXCLUDE = "",
+  IGNORE_EXACT = "",
 
-  // Zapisywanie tokenów
-  TOKENS_PATH = "/tmp/kick_tokens.json",
+  // Tokeny
   DATA_DIR = "/tmp",
+  TOKENS_PATH = "/tmp/kick_tokens.json",
   KICK_REFRESH_TOKEN = "",
 
-  // Harmonogram wiadomości (nie przeszkadza echosowi)
+  // Polling
+  POLL_SECONDS = "60",
+
+  // (opcjonalne) scheduler random message – nie używany tutaj
   RAND_MIN_MINUTES = "",
   RAND_MAX_MINUTES = "",
   INTERVAL_MINUTES = "5",
   JITTER_SECONDS = "30,60",
-  POLL_SECONDS = "60",
 } = process.env;
 
-/* ---------- Parse helpers ---------- */
+/* ---------- Helpers ---------- */
 const allowedSlugs = String(ALLOWED_SLUGS || "")
   .split(",")
   .map((s) => s.trim().toLowerCase())
@@ -92,17 +102,15 @@ app.use(
   })
 );
 
-/* ---------- Pomoc do mountowania wielu ścieżek ---------- */
+/* ---------- Mount helpers ---------- */
 function mountGet(paths, handler) {
-  const list = Array.isArray(paths) ? paths : [paths];
-  list.forEach((p) => app.get(p, handler));
+  (Array.isArray(paths) ? paths : [paths]).forEach((p) => app.get(p, handler));
 }
 function mountPost(paths, handler) {
-  const list = Array.isArray(paths) ? paths : [paths];
-  list.forEach((p) => app.post(p, handler));
+  (Array.isArray(paths) ? paths : [paths]).forEach((p) => app.post(p, handler));
 }
 
-/* ---------- Tokeny ---------- */
+/* ---------- Tokeny użytkownika ---------- */
 let tokens = { access_token: null, refresh_token: null, expires_at: 0 };
 
 function saveTokens() {
@@ -117,12 +125,15 @@ function loadTokens() {
       if (t?.refresh_token) tokens = t;
     }
   } catch {}
-  if (!tokens.refresh_token && KICK_REFRESH_TOKEN) tokens.refresh_token = KICK_REFRESH_TOKEN.trim();
+  if (!tokens.refresh_token && KICK_REFRESH_TOKEN)
+    tokens.refresh_token = KICK_REFRESH_TOKEN.trim();
 }
 async function refreshIfNeeded() {
   const now = Math.floor(Date.now() / 1000);
-  if (tokens.access_token && now < Number(tokens.expires_at || 0) - 60) return tokens.access_token;
-  if (!tokens.refresh_token) throw new Error("Brak refresh_token – zrób /oauth/start (lub /auth/start)");
+  if (tokens.access_token && now < Number(tokens.expires_at || 0) - 60)
+    return tokens.access_token;
+  if (!tokens.refresh_token)
+    throw new Error("Brak refresh_token – odwiedź /oauth/start lub /auth/start");
 
   const params = new URLSearchParams();
   params.append("grant_type", "refresh_token");
@@ -137,45 +148,67 @@ async function refreshIfNeeded() {
 
   tokens.access_token = data.access_token;
   tokens.refresh_token = data.refresh_token;
-  tokens.expires_at = Math.floor(Date.now() / 1000) + (data.expires_in || 3600);
+  tokens.expires_at =
+    Math.floor(Date.now() / 1000) + (data.expires_in || 3600);
   saveTokens();
   return tokens.access_token;
 }
 
-/* ---------- App token (do public API) ---------- */
+/* ---------- App token (public API) ---------- */
 let appToken = { token: null, expires_at: 0 };
 async function getAppToken() {
   const now = Math.floor(Date.now() / 1000);
-  if (appToken.token && now < Number(appToken.expires_at || 0) - 60) return appToken.token;
+  if (appToken.token && now < Number(appToken.expires_at || 0) - 60)
+    return appToken.token;
+
   const params = new URLSearchParams();
   params.append("grant_type", "client_credentials");
   params.append("client_id", KICK_CLIENT_ID);
   params.append("client_secret", KICK_CLIENT_SECRET);
+
   const { data } = await axios.post(TOKEN_URL, params, {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     timeout: 15000,
   });
+
   appToken.token = data.access_token;
   appToken.expires_at = now + (data.expires_in || 3600);
   return appToken.token;
 }
 
-/* ---------- Kanał -> id ---------- */
+/* ---------- Kanały ---------- */
 const channelIdCache = new Map(); // slug -> broadcaster_user_id
+
+// Próbuje obu wariantów sluga: "-" i "_", i dwóch formatów paramów (slug oraz slug[])
 async function getChannelsBySlugs(slugs) {
-  const list = (Array.isArray(slugs) ? slugs : [slugs])
+  const base = (Array.isArray(slugs) ? slugs : [slugs])
     .map((s) => String(s || "").trim().toLowerCase())
     .filter(Boolean);
-  if (!list.length) return [];
+  if (!base.length) return [];
+
+  const list = Array.from(
+    new Set(
+      base.flatMap((s) => {
+        const alts = [s];
+        if (s.includes("-")) alts.push(s.replace(/-/g, "_"));
+        if (s.includes("_")) alts.push(s.replace(/_/g, "-"));
+        return alts;
+      })
+    )
+  );
+
   const token = await getAppToken();
-  const base = "https://api.kick.com/public/v1/channels";
+  const baseUrl = "https://api.kick.com/public/v1/channels";
   const headers = { Authorization: `Bearer ${token}` };
   const timeout = 15000;
 
   if (list.length === 1) {
     const slug = encodeURIComponent(list[0]);
     try {
-      const { data } = await axios.get(`${base}/${slug}`, { headers, timeout });
+      const { data } = await axios.get(`${baseUrl}/${slug}`, {
+        headers,
+        timeout,
+      });
       const ch = data?.data || data;
       if (ch) {
         if (ch.slug) channelIdCache.set(ch.slug, ch.broadcaster_user_id);
@@ -186,26 +219,38 @@ async function getChannelsBySlugs(slugs) {
     }
   }
 
+  // 1) slug=foo&slug=bar
   try {
     const qs = list.map((s) => `slug=${encodeURIComponent(s)}`).join("&");
-    const { data } = await axios.get(`${base}?${qs}`, { headers, timeout });
+    const { data } = await axios.get(`${baseUrl}?${qs}`, {
+      headers,
+      timeout,
+    });
     if (Array.isArray(data?.data) && data.data.length) {
-      for (const ch of data.data) channelIdCache.set(ch.slug, ch.broadcaster_user_id);
+      for (const ch of data.data)
+        channelIdCache.set(ch.slug, ch.broadcaster_user_id);
       return data.data;
     }
   } catch {}
+
+  // 2) slug[]=foo&slug[]=bar
   try {
     const qs = list.map((s) => `slug[]=${encodeURIComponent(s)}`).join("&");
-    const { data } = await axios.get(`${base}?${qs}`, { headers, timeout });
+    const { data } = await axios.get(`${baseUrl}?${qs}`, {
+      headers,
+      timeout,
+    });
     if (Array.isArray(data?.data) && data.data.length) {
-      for (const ch of data.data) channelIdCache.set(ch.slug, ch.broadcaster_user_id);
+      for (const ch of data.data)
+        channelIdCache.set(ch.slug, ch.broadcaster_user_id);
       return data.data;
     }
   } catch {}
+
   return [];
 }
 
-/* ---------- Wysyłanie wiadomości ---------- */
+/* ---------- Wysyłanie na czat ---------- */
 async function sendChatMessage({ broadcaster_user_id, content, type = "user" }) {
   const token = await refreshIfNeeded();
   await axios.post(
@@ -216,13 +261,14 @@ async function sendChatMessage({ broadcaster_user_id, content, type = "user" }) 
   markEchoSent(broadcaster_user_id, content);
 }
 
-/* ---------- ECHO (5 tych samych) ---------- */
+/* ---------- ECHO (powtórzenia !komend) ---------- */
 const echoEnabled = String(CMD_ECHO_ENABLED).toLowerCase() === "true";
 const echoMinRun = Math.max(
   2,
-  Number(CMD_ECHO_MIN_RUN ?? ECHO_THRESHOLD ?? 5) // alias ECHO_THRESHOLD
+  Number(CMD_ECHO_MIN_RUN ?? ECHO_THRESHOLD ?? 5)
 );
-const echoCooldownMs = Math.max(5, Number(CMD_ECHO_COOLDOWN_SECONDS) || 60) * 1000;
+const echoCooldownMs =
+  Math.max(5, Number(CMD_ECHO_COOLDOWN_SECONDS) || 60) * 1000;
 const echoExclude = new Set(
   (CMD_ECHO_EXCLUDE || IGNORE_EXACT || "")
     .split(",")
@@ -245,77 +291,94 @@ function wasEchoSentRecently(id, content) {
   return Boolean(ts && Date.now() - ts < 30_000);
 }
 
-/* ---------- WebSocket czatu (z obejściem chatroom_id) ---------- */
+/* ---------- WebSocket czatu + fallbacky na chatroom_id ---------- */
 const wsBySlug = new Map();
 const missingChatLogOnce = new Set();
 
 async function getChannelWithChatroom(slug) {
-  const ov = CHATROOM_OVERRIDES[slug];
+  const s = String(slug || "").toLowerCase();
+  const ov = CHATROOM_OVERRIDES[s];
   let ch = null;
   let chatroom_id = null;
 
   if (ov) {
-    ch = (await getChannelsBySlugs([slug]))?.[0] || { slug, broadcaster_user_id: channelIdCache.get(slug) ?? null };
+    ch =
+      (await getChannelsBySlugs([s]))?.[0] || {
+        slug: s,
+        broadcaster_user_id: channelIdCache.get(s) ?? null,
+      };
     return { ch, chatroom_id: ov };
   }
 
+  // 1) public/v1
   try {
-    ch = (await getChannelsBySlugs([slug]))?.[0] || null;
+    ch = (await getChannelsBySlugs([s]))?.[0] || null;
     chatroom_id = ch?.chatroom?.id ?? ch?.chatroom_id ?? null;
   } catch {}
 
+  // 2) api/v2 (JSON)
   if (!chatroom_id) {
     try {
-      const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
-        timeout: 15000,
-        headers: JSON_HEADERS,
-      });
+      const { data } = await axios.get(
+        `https://kick.com/api/v2/channels/${encodeURIComponent(s)}`,
+        { timeout: 15000, headers: JSON_HEADERS }
+      );
       chatroom_id = data?.chatroom?.id ?? data?.data?.chatroom?.id ?? null;
       if (!ch && data) {
         ch = {
-          slug,
-          broadcaster_user_id: data?.user_id ?? data?.data?.user_id ?? channelIdCache.get(slug) ?? null,
+          slug: s,
+          broadcaster_user_id:
+            data?.user_id ??
+            data?.data?.user_id ??
+            channelIdCache.get(s) ??
+            null,
         };
       }
     } catch {}
   }
 
+  // 3) api/v2 (HTML jako tekst)
   if (!chatroom_id) {
     try {
-      const { data: raw } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
-        timeout: 15000,
-        headers: HTML_HEADERS,
-        responseType: "text",
-      });
+      const { data: raw } = await axios.get(
+        `https://kick.com/api/v2/channels/${encodeURIComponent(s)}`,
+        { timeout: 15000, headers: HTML_HEADERS, responseType: "text" }
+      );
       let m = /"chatroom"\s*:\s*\{\s*"id"\s*:\s*(\d+)/.exec(raw);
       if (!m) m = /"chatroom_id"\s*:\s*(\d+)/.exec(raw);
       if (m) chatroom_id = Number(m[1]);
     } catch {}
   }
 
+  // 4) /chatroom
   if (!chatroom_id) {
     try {
       const { data } = await axios.get(
-        `https://kick.com/api/v2/channels/${encodeURIComponent(slug)}/chatroom`,
+        `https://kick.com/api/v2/channels/${encodeURIComponent(s)}/chatroom`,
         { timeout: 15000, headers: JSON_HEADERS }
       );
       chatroom_id = data?.id ?? null;
     } catch {}
   }
 
+  // 5) strona kanału (HTML)
   if (!chatroom_id) {
     try {
-      const { data: html } = await axios.get(`https://kick.com/${encodeURIComponent(slug)}`, {
-        timeout: 15000,
-        headers: HTML_HEADERS,
-        responseType: "text",
-      });
+      const { data: html } = await axios.get(
+        `https://kick.com/${encodeURIComponent(s)}`,
+        { timeout: 15000, headers: HTML_HEADERS, responseType: "text" }
+      );
       let m = /"chatroom"\s*:\s*\{\s*"id"\s*:\s*(\d+)/.exec(html);
       if (!m) m = /"chatroom_id"\s*:\s*(\d+)/.exec(html);
       if (m) chatroom_id = Number(m[1]);
       if (!ch) {
         const u = /"user_id"\s*:\s*(\d+)/.exec(html);
-        ch = { slug, broadcaster_user_id: u ? Number(u[1]) : channelIdCache.get(slug) ?? null };
+        ch = {
+          slug: s,
+          broadcaster_user_id: u
+            ? Number(u[1])
+            : channelIdCache.get(s) ?? null,
+        };
       }
     } catch {}
   }
@@ -354,10 +417,14 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
         try {
           socket.emit("SUBSCRIBE", { room: `chatrooms:${chatroom_id}` });
         } catch {}
-        console.log(`WS connected for ${slug} (chatrooms:${chatroom_id})`);
+        console.log(
+          `WS connected for ${slug} (chatrooms:${chatroom_id})`
+        );
       });
 
-      socket.on("disconnect", () => console.log(`WS disconnected for ${slug}`));
+      socket.on("disconnect", () =>
+        console.log(`WS disconnected for ${slug}`)
+      );
 
       const onMsg = async (payload) => {
         try {
@@ -370,7 +437,13 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
           if (echoExclude.has(lower)) return;
           if (wasEchoSentRecently(broadcaster_user_id, content)) return;
 
-          const st = echoStateByChannel.get(broadcaster_user_id) || { current: "", count: 0, lastSentAt: 0 };
+          const st =
+            echoStateByChannel.get(broadcaster_user_id) || {
+              current: "",
+              count: 0,
+              lastSentAt: 0,
+            };
+
           if (st.current === lower) st.count += 1;
           else {
             st.current = lower;
@@ -380,7 +453,11 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
           const now = Date.now();
           if (st.count >= echoMinRun && now - st.lastSentAt > echoCooldownMs) {
             try {
-              await sendChatMessage({ broadcaster_user_id, content, type: "user" });
+              await sendChatMessage({
+                broadcaster_user_id,
+                content,
+                type: "user",
+              });
               st.lastSentAt = now;
               st.count = 0;
             } catch {}
@@ -395,7 +472,7 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
     .catch(() => {});
 }
 
-/* ---------- Polling live on/off (fallback) ---------- */
+/* ---------- Polling live on/off (fallback do startu WS) ---------- */
 const pollMs = Math.max(30, Number(POLL_SECONDS) || 60) * 1000;
 async function pollingTick() {
   try {
@@ -415,12 +492,12 @@ async function pollingTick() {
   }
 }
 
-/* ---------- OAuth START / CALLBACK (wszystkie warianty) ---------- */
+/* ---------- OAuth: START / CALLBACK (wiele aliasów) ---------- */
 function buildAuthorizeURL(state, codeChallenge) {
   const params = new URLSearchParams({
     response_type: "code",
     client_id: KICK_CLIENT_ID,
-    redirect_uri: KICK_REDIRECT_URI || "", // nie wymagamy tutaj poprawności – i tak obsłużymy różne ścieżki
+    redirect_uri: KICK_REDIRECT_URI || "",
     scope: "user:read channel:read chat:write events:subscribe",
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
@@ -448,9 +525,11 @@ mountGet(startPaths, (req, res) => {
   const hash = crypto.createHash("sha256").update(codeVerifier).digest();
   const codeChallenge = Buffer.from(hash).toString("base64url");
   const state = crypto.randomBytes(8).toString("hex");
+
   let store = {};
   try {
-    if (fs.existsSync(PKCE_FILE)) store = JSON.parse(fs.readFileSync(PKCE_FILE, "utf-8"));
+    if (fs.existsSync(PKCE_FILE))
+      store = JSON.parse(fs.readFileSync(PKCE_FILE, "utf-8"));
   } catch {}
   store[state] = { verifier: codeVerifier, ts: Date.now() };
   try {
@@ -462,21 +541,32 @@ mountGet(startPaths, (req, res) => {
 mountGet(callbackPaths, async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
-    if (error) return res.status(400).send(`OAuth error: ${error} ${error_description || ""}`);
+    if (error)
+      return res
+        .status(400)
+        .send(`OAuth error: ${error} ${error_description || ""}`);
 
-    if (!code || !state) return res.status(400).send("Brak code/state – uruchom /oauth/start jeszcze raz.");
+    if (!code || !state)
+      return res
+        .status(400)
+        .send("Brak code/state – uruchom /auth/start jeszcze raz.");
+
     let store = {};
     try {
-      if (fs.existsSync(PKCE_FILE)) store = JSON.parse(fs.readFileSync(PKCE_FILE, "utf-8"));
+      if (fs.existsSync(PKCE_FILE))
+        store = JSON.parse(fs.readFileSync(PKCE_FILE, "utf-8"));
     } catch {}
     const codeVerifier = store?.[String(state)]?.verifier;
-    if (!codeVerifier) return res.status(400).send("Brak code_verifier – odpal /oauth/start ponownie.");
+    if (!codeVerifier)
+      return res
+        .status(400)
+        .send("Brak code_verifier – odpal /auth/start ponownie.");
 
     const params = new URLSearchParams({
       grant_type: "authorization_code",
       client_id: KICK_CLIENT_ID,
       client_secret: KICK_CLIENT_SECRET,
-      redirect_uri: KICK_REDIRECT_URI || "", // musi się zgadzać z tym u Kicka, ale ścieżkę też łapiemy tutaj
+      redirect_uri: KICK_REDIRECT_URI || "",
       code_verifier: codeVerifier,
       code: String(code),
     });
@@ -488,13 +578,18 @@ mountGet(callbackPaths, async (req, res) => {
 
     tokens.access_token = data.access_token;
     tokens.refresh_token = data.refresh_token;
-    tokens.expires_at = Math.floor(Date.now() / 1000) + (data.expires_in || 3600);
+    tokens.expires_at =
+      Math.floor(Date.now() / 1000) + (data.expires_in || 3600);
     saveTokens();
 
-    res.send("OK – tokeny zapisane. Możesz zamknąć kartę. Sprawdź /tokens lub /chat/test.");
+    res.send(
+      "OK – tokeny zapisane. Możesz zamknąć kartę. Sprawdź /tokens lub /chat/test."
+    );
   } catch (e) {
     console.error("Callback error:", e.response?.data || e.message);
-    res.status(500).send("Błąd callback: " + (e.response?.data?.error_description || e.message));
+    res
+      .status(500)
+      .send("Błąd callback: " + (e.response?.data?.error_description || e.message));
   }
 });
 
@@ -505,8 +600,19 @@ app.get("/tokens", (_req, res) => {
   const has_access_token = Boolean(tokens?.access_token);
   const has_refresh_token = Boolean(tokens?.refresh_token);
   const token_type = has_access_token ? "Bearer" : null;
-  const expires_in = has_access_token ? Math.max(0, Number(tokens.expires_at || 0) - Math.floor(Date.now() / 1000)) : null;
-  res.json({ has_access_token, has_refresh_token, token_type, expires_in, obtained_at: tokens?.obtained_at, scope: "user:read chat:write" });
+  const expires_in = has_access_token
+    ? Math.max(
+        0,
+        Number(tokens.expires_at || 0) - Math.floor(Date.now() / 1000)
+      )
+    : null;
+  res.json({
+    has_access_token,
+    has_refresh_token,
+    token_type,
+    expires_in,
+    scope: "user:read chat:write",
+  });
 });
 
 /* Admin: ręczne wysłanie (GET) */
@@ -518,7 +624,6 @@ app.get("/admin/send", async (req, res) => {
     const slug = String(req.query.slug || allowedSlugs[0] || "").toLowerCase();
     const msg = String(req.query.msg || "TEST").slice(0, 280);
     if (!slug) return res.status(400).json({ error: "Brak slug" });
-    if (!allowedSlugs.includes(slug)) return res.status(403).json({ error: "Slug poza ALLOWED_SLUGS" });
 
     const chans = await getChannelsBySlugs([slug]);
     const id = chans?.[0]?.broadcaster_user_id;
@@ -527,11 +632,13 @@ app.get("/admin/send", async (req, res) => {
     await sendChatMessage({ broadcaster_user_id: id, content: msg, type: "user" });
     return res.json({ ok: true, sent_to: { slug, id }, msg });
   } catch (e) {
-    return res.status(e?.response?.status || 500).json({ ok: false, status: e?.response?.status, data: e?.response?.data || e.message });
+    return res
+      .status(e?.response?.status || 500)
+      .json({ ok: false, status: e?.response?.status, data: e?.response?.data || e.message });
   }
 });
 
-/* Admin: wymuś WS nasłuch (offline test) */
+/* Admin: wymuś WS nasłuch (działa offline) */
 app.get("/admin/ws-listen", async (req, res) => {
   try {
     const key = req.query.key || req.get("X-Admin-Key");
@@ -540,8 +647,16 @@ app.get("/admin/ws-listen", async (req, res) => {
     const slug = String(req.query.slug || allowedSlugs[0] || "").toLowerCase();
     if (!slug) return res.status(400).json({ error: "missing slug" });
 
+    // Pobierz dane kanału z fallbackami (zapewnia broadcaster_user_id)
+    const { ch } = await getChannelWithChatroom(slug);
     const chans = await getChannelsBySlugs([slug]);
-    const id = chans?.[0]?.broadcaster_user_id || 0;
+
+    const id =
+      ch?.broadcaster_user_id ||
+      chans?.[0]?.broadcaster_user_id ||
+      channelIdCache.get(slug) ||
+      0;
+
     ensureWsListener(slug, id);
     return res.json({ ok: true, listening: true, slug, id });
   } catch (e) {
@@ -584,7 +699,7 @@ mountPost("/chat/test", async (req, res) => {
   }
 });
 
-/* Subskrypcje (GET z kluczem lub POST) */
+/* Subskrypcje (opcjonalne) */
 mountPost("/subscribe", async (_req, res) => {
   try {
     const token = await refreshIfNeeded();
