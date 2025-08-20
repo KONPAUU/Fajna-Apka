@@ -1,6 +1,6 @@
 // server.js  (ESM) — Kick echo bot + OAuth
 // Logika bez zmian: OAuth, /chat/test, echo po X powtórzeniach, polling live.
-// Zmiany: stabilniejsze WS (kilka hostów), lepsze nagłówki i logi, aliasy /auth/*, DIAG /admin/ws-diag.
+// Dodatki: stabilniejsze połączenia (lista hostów, wsparcie HTTPS/polling), /admin/ws-diag, bogatsze logi.
 
 /* ---------- importy ---------- */
 import "dotenv/config";
@@ -50,17 +50,12 @@ const {
   DATA_DIR = "/tmp",
   KICK_REFRESH_TOKEN = "",
 
-  // harmonogram „polling” (live on/off)
-  RAND_MIN_MINUTES = "",
-  RAND_MAX_MINUTES = "",
-  INTERVAL_MINUTES = "5",
-  JITTER_SECONDS = "30,60",
+  // polling (live on/off)
   POLL_SECONDS = "60",
 
-  // WebSocket: można narzucić konkretny URL albo listę (próby po kolei)
+  // WebSocket/Socket.IO hosty — pozwalamy też na HTTPS (polling)
   KICK_WS_URL = "",
-  KICK_WS_URLS = "wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com",
-  // Ostateczna deska ratunku (nie używać, chyba że Cloudflare/TLS bruździ):
+  KICK_WS_URLS = "https://kick.com,wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com",
   WS_INSECURE = "false",
 } = process.env;
 
@@ -107,22 +102,14 @@ app.use(
 );
 
 /* ---------- mount helpers ---------- */
-function mountGet(paths, handler) {
-  (Array.isArray(paths) ? paths : [paths]).forEach((p) => app.get(p, handler));
-}
-function mountPost(paths, handler) {
-  (Array.isArray(paths) ? paths : [paths]).forEach((p) => app.post(p, handler));
-}
+const mountGet = (p, h) => (Array.isArray(p) ? p : [p]).forEach((x) => app.get(x, h));
+const mountPost = (p, h) => (Array.isArray(p) ? p : [p]).forEach((x) => app.post(x, h));
 
 /* ---------- tokeny ---------- */
 let tokens = { access_token: null, refresh_token: null, expires_at: 0 };
 
-function saveTokens() {
-  try {
-    fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
-  } catch {}
-}
-function loadTokens() {
+const saveTokens = () => { try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2)); } catch {} };
+(function loadTokens() {
   try {
     if (fs.existsSync(TOKENS_FILE)) {
       const t = JSON.parse(fs.readFileSync(TOKENS_FILE, "utf-8"));
@@ -130,7 +117,8 @@ function loadTokens() {
     }
   } catch {}
   if (!tokens.refresh_token && KICK_REFRESH_TOKEN) tokens.refresh_token = KICK_REFRESH_TOKEN.trim();
-}
+})();
+
 async function refreshIfNeeded() {
   const now = Math.floor(Date.now() / 1000);
   if (tokens.access_token && now < Number(tokens.expires_at || 0) - 60) return tokens.access_token;
@@ -154,19 +142,22 @@ async function refreshIfNeeded() {
   return tokens.access_token;
 }
 
-/* ---------- app token do public API ---------- */
+/* ---------- app token ---------- */
 let appToken = { token: null, expires_at: 0 };
 async function getAppToken() {
   const now = Math.floor(Date.now() / 1000);
   if (appToken.token && now < Number(appToken.expires_at || 0) - 60) return appToken.token;
+
   const params = new URLSearchParams();
   params.append("grant_type", "client_credentials");
   params.append("client_id", KICK_CLIENT_ID);
   params.append("client_secret", KICK_CLIENT_SECRET);
+
   const { data } = await axios.post(TOKEN_URL, params, {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     timeout: 15000,
   });
+
   appToken.token = data.access_token;
   appToken.expires_at = now + (data.expires_in || 3600);
   return appToken.token;
@@ -255,8 +246,8 @@ function wasEchoSentRecently(id, content) {
   return Boolean(ts && Date.now() - ts < 30_000);
 }
 
-/* ---------- WS czatu ---------- */
-const wsBySlug = new Map(); // slug -> socket
+/* ---------- WS/Socket.IO czatu ---------- */
+const wsBySlug = new Map();
 const missingChatLogOnce = new Set();
 
 async function getChannelWithChatroom(slug) {
@@ -352,12 +343,17 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
         return;
       }
 
-      const urls = WS_CANDIDATES.length ? WS_CANDIDATES : ["wss://ws2.chat.kick.com", "wss://ws1.chat.kick.com", "wss://chat.kick.com"];
+      const urls = WS_CANDIDATES.length
+        ? WS_CANDIDATES
+        : ["https://kick.com", "wss://ws2.chat.kick.com", "wss://ws1.chat.kick.com", "wss://chat.kick.com"];
+
       let idx = 0;
       let socket = null;
 
       const connect = () => {
         const url = urls[idx % urls.length];
+        const isHttp = /^https:\/\//i.test(url);
+
         const headers = {
           "User-Agent": UA,
           Origin: `https://kick.com/${slug}`,
@@ -365,7 +361,7 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
         };
 
         socket = io(url, {
-          transports: ["websocket"],
+          transports: isHttp ? ["polling", "websocket"] : ["websocket"], // HTTPS = pozwól na polling
           path: "/socket.io",
           forceNew: true,
           reconnection: true,
@@ -388,15 +384,12 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
         });
 
         socket.on("connect_error", (err) => {
-          const msg =
-            err?.message ||
-            err?.data ||
-            (typeof err === "string" ? err : JSON.stringify(err || {}));
+          const msg = err?.message || err?.data || (typeof err === "string" ? err : JSON.stringify(err || {}));
           const ctx = err?.context ? JSON.stringify(err.context) : "";
           console.error("WS connect_error", { slug, url, msg, ctx });
           try { socket?.close?.(); } catch {}
           idx += 1;
-          setTimeout(connect, 2000);
+          setTimeout(connect, 1500);
         });
 
         socket.on("error", (err) => {
@@ -483,55 +476,40 @@ function buildAuthorizeURL(state, codeChallenge) {
   return `${AUTH_URL}?${params.toString()}`;
 }
 
-const startPaths = [
-  `${KICK_OAUTH_PREFIX}/start`,
-  "/oauth/start",
-  "/auth/start",
-  "/start",
-];
-const callbackPaths = [
-  `${KICK_OAUTH_PREFIX}/callback`,
-  "/oauth/callback",
-  "/auth/callback",
-  "/callback",
-];
+const startPaths = [`${KICK_OAUTH_PREFIX}/start`, "/oauth/start", "/auth/start", "/start"];
+const callbackPaths = [`${KICK_OAUTH_PREFIX}/callback`, "/oauth/callback", "/auth/callback", "/callback"];
 
-mountGet(startPaths, (req, res) => {
+mountGet(startPaths, (_req, res) => {
   if (!KICK_CLIENT_ID) return res.status(400).send("Missing KICK_CLIENT_ID");
-  const codeVerifier = crypto.randomBytes(32).toString("base64url");
-  const hash = crypto.createHash("sha256").update(codeVerifier).digest();
-  const codeChallenge = Buffer.from(hash).toString("base64url");
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest().toString("base64url");
   const state = crypto.randomBytes(8).toString("hex");
+
   let store = {};
-  try {
-    if (fs.existsSync(PKCE_FILE)) store = JSON.parse(fs.readFileSync(PKCE_FILE, "utf-8"));
-  } catch {}
-  store[state] = { verifier: codeVerifier, ts: Date.now() };
-  try {
-    fs.writeFileSync(PKCE_FILE, JSON.stringify(store, null, 2));
-  } catch {}
-  res.redirect(buildAuthorizeURL(state, codeChallenge));
+  try { if (fs.existsSync(PKCE_FILE)) store = JSON.parse(fs.readFileSync(PKCE_FILE, "utf-8")); } catch {}
+  store[state] = { verifier, ts: Date.now() };
+  try { fs.writeFileSync(PKCE_FILE, JSON.stringify(store, null, 2)); } catch {}
+
+  res.redirect(buildAuthorizeURL(state, challenge));
 });
 
 mountGet(callbackPaths, async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
     if (error) return res.status(400).send(`OAuth error: ${error} ${error_description || ""}`);
-
     if (!code || !state) return res.status(400).send("Brak code/state – uruchom /oauth/start jeszcze raz.");
+
     let store = {};
-    try {
-      if (fs.existsSync(PKCE_FILE)) store = JSON.parse(fs.readFileSync(PKCE_FILE, "utf-8"));
-    } catch {}
-    const codeVerifier = store?.[String(state)]?.verifier;
-    if (!codeVerifier) return res.status(400).send("Brak code_verifier – odpal /oauth/start ponownie.");
+    try { if (fs.existsSync(PKCE_FILE)) store = JSON.parse(fs.readFileSync(PKCE_FILE, "utf-8")); } catch {}
+    const verifier = store?.[String(state)]?.verifier;
+    if (!verifier) return res.status(400).send("Brak code_verifier – odpal /oauth/start ponownie.");
 
     const params = new URLSearchParams({
       grant_type: "authorization_code",
       client_id: KICK_CLIENT_ID,
       client_secret: KICK_CLIENT_SECRET,
       redirect_uri: KICK_REDIRECT_URI || "",
-      code_verifier: codeVerifier,
+      code_verifier: verifier,
       code: String(code),
     });
 
@@ -560,28 +538,28 @@ app.get("/tokens", (_req, res) => {
   const has_refresh_token = Boolean(tokens?.refresh_token);
   const token_type = has_access_token ? "Bearer" : null;
   const expires_in = has_access_token ? Math.max(0, Number(tokens.expires_at || 0) - Math.floor(Date.now() / 1000)) : null;
-  res.json({ has_access_token, has_refresh_token, token_type, expires_in, obtained_at: tokens?.obtained_at, scope: "user:read chat:write" });
+  res.json({ has_access_token, has_refresh_token, token_type, expires_in, scope: "user:read chat:write" });
 });
 
-/* --- DIAG: sprawdza endpoint engine.io (polling) dla hostów WS --- */
+/* --- DIAG: sprawdza engine.io (polling) na hostach --- */
 app.get("/admin/ws-diag", async (req, res) => {
   try {
     const slug = String(req.query.slug || (ALLOWED_SLUGS.split(",")[0] || "")).toLowerCase();
-    const hosts = (process.env.KICK_WS_URL || process.env.KICK_WS_URLS || "wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com")
+    const hosts = (process.env.KICK_WS_URL || process.env.KICK_WS_URLS || "https://kick.com,wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com")
       .split(",").map(s => s.trim()).filter(Boolean);
     const results = [];
-    for (const wss of hosts) {
-      const https = wss.replace(/^wss:/, "https:");
+    for (const host of hosts) {
+      const https = host.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
       const url = `${https}/socket.io/?EIO=4&transport=polling&t=${Date.now()}`;
       try {
         const r = await axios.get(url, {
           timeout: 8000,
           headers: { Origin: `https://kick.com/${slug}`, Referer: `https://kick.com/${slug}`, "User-Agent": UA }
         });
-        results.push({ host: wss, ok: true, status: r.status, data: String(r.data).slice(0,120) });
+        results.push({ host, ok: true, status: r.status, data: String(r.data).slice(0,120) });
       } catch (e) {
         results.push({
-          host: wss, ok: false,
+          host, ok: false,
           status: e?.response?.status || null,
           error: e?.message || String(e),
           body: e?.response?.data ? String(e.response.data).slice(0,120) : null
@@ -634,7 +612,7 @@ app.get("/admin/ws-listen", async (req, res) => {
   }
 });
 
-/* Admin: szybki debug (chatroom_id, is_live itp.) */
+/* Admin: szybki debug (chatroom_id, itp.) */
 app.get("/admin/debug", async (req, res) => {
   try {
     const slug = String(req.query.slug || allowedSlugs[0] || "").toLowerCase();
@@ -714,8 +692,6 @@ mountGet("/subscribe", async (req, res) => {
 });
 
 /* ---------- start ---------- */
-loadTokens();
-
 app.listen(PORT, () => {
   console.log(`auth+bot app listening on :${PORT}`);
   console.log(`Using OAuth prefix: ${KICK_OAUTH_PREFIX} (authorize: ${AUTH_URL})`);
