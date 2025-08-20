@@ -1,8 +1,7 @@
 // server.js  (ESM) — Kick echo bot + OAuth
-// Logika bez zmian: OAuth, /chat/test, echo po X powtórzeniach, polling live.
-// Dodatki: stabilniejsze połączenia (lista hostów, wsparcie HTTPS/polling), /admin/ws-diag, bogatsze logi.
+// Logika: OAuth, /chat/test, echo po X powtórzeniach, polling live.
+// Dodatki: stabilniejsze połączenia (lista hostów), /admin/ws-diag, bogatsze logi.
 
-/* ---------- importy ---------- */
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
@@ -53,9 +52,9 @@ const {
   // polling (live on/off)
   POLL_SECONDS = "60",
 
-  // WebSocket/Socket.IO hosty — pozwalamy też na HTTPS (polling)
+  // WebSocket/Socket.IO hosty (domyślnie tylko wss)
   KICK_WS_URL = "",
-  KICK_WS_URLS = "https://kick.com,wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com",
+  KICK_WS_URLS = "wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com",
   WS_INSECURE = "false",
 } = process.env;
 
@@ -108,7 +107,11 @@ const mountPost = (p, h) => (Array.isArray(p) ? p : [p]).forEach((x) => app.post
 /* ---------- tokeny ---------- */
 let tokens = { access_token: null, refresh_token: null, expires_at: 0 };
 
-const saveTokens = () => { try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2)); } catch {} };
+const saveTokens = () => {
+  try {
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
+  } catch {}
+};
 (function loadTokens() {
   try {
     if (fs.existsSync(TOKENS_FILE)) {
@@ -345,7 +348,7 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
 
       const urls = WS_CANDIDATES.length
         ? WS_CANDIDATES
-        : ["https://kick.com", "wss://ws2.chat.kick.com", "wss://ws1.chat.kick.com", "wss://chat.kick.com"];
+        : ["wss://ws2.chat.kick.com", "wss://ws1.chat.kick.com", "wss://chat.kick.com"];
 
       let idx = 0;
       let socket = null;
@@ -353,33 +356,31 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
       const connect = () => {
         const url = urls[idx % urls.length];
         const isHttp = /^https:\/\//i.test(url);
-const isHttp = /^https:\/\//i.test(url);
 
-const headers = {
-  "User-Agent": UA,
-  Origin: `https://kick.com/${slug}`,
-  Referer: `https://kick.com/${slug}`,
-};
+        const headers = {
+          "User-Agent": UA,
+          Origin: `https://kick.com/${slug}`,
+          Referer: `https://kick.com/${slug}`,
+        };
 
-socket = io(url, {
-  transports: isHttp ? ["polling", "websocket"] : ["websocket"],
-  path: "/socket.io",
-  forceNew: true,
-  reconnection: true,
-  reconnectionDelayMax: 15000,
-  timeout: 15000,
-  withCredentials: true,
+        socket = io(url, {
+          transports: isHttp ? ["polling", "websocket"] : ["websocket"],
+          path: "/socket.io",
+          forceNew: true,
+          reconnection: true,
+          reconnectionDelayMax: 15000,
+          timeout: 15000,
+          withCredentials: true,
 
-  // BYŁO: extraHeaders: headers,
-  // DODANE: nagłówki także dla WS-upgrade i pollingu
-  extraHeaders: headers,
-  transportOptions: {
-    polling:   { extraHeaders: headers },
-    websocket: { extraHeaders: headers },
-  },
+          // nagłówki również dla pollingu i upgradu WS
+          extraHeaders: headers,
+          transportOptions: {
+            polling:   { extraHeaders: headers },
+            websocket: { extraHeaders: headers },
+          },
 
-  rejectUnauthorized: String(WS_INSECURE).toLowerCase() === "true" ? false : true,
-});
+          rejectUnauthorized: String(WS_INSECURE).toLowerCase() === "true" ? false : true,
+        });
         wsBySlug.set(slug, socket);
 
         socket.on("connect", () => {
@@ -490,7 +491,7 @@ const callbackPaths = [`${KICK_OAUTH_PREFIX}/callback`, "/oauth/callback", "/aut
 mountGet(startPaths, (_req, res) => {
   if (!KICK_CLIENT_ID) return res.status(400).send("Missing KICK_CLIENT_ID");
   const verifier = crypto.randomBytes(32).toString("base64url");
-  const challenge = crypto.createHash("sha256").update(verifier).digest().toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
   const state = crypto.randomBytes(8).toString("hex");
 
   let store = {};
@@ -553,7 +554,7 @@ app.get("/tokens", (_req, res) => {
 app.get("/admin/ws-diag", async (req, res) => {
   try {
     const slug = String(req.query.slug || (ALLOWED_SLUGS.split(",")[0] || "")).toLowerCase();
-    const hosts = (process.env.KICK_WS_URL || process.env.KICK_WS_URLS || "https://kick.com,wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com")
+    const hosts = (process.env.KICK_WS_URL || process.env.KICK_WS_URLS || "wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com")
       .split(",").map(s => s.trim()).filter(Boolean);
     const results = [];
     for (const host of hosts) {
