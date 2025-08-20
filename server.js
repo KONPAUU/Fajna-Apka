@@ -1,6 +1,6 @@
-// server.js  (ESM) — Kick echo bot + OAuth
-// Logika: OAuth, /chat/test, echo po X powtórzeniach, polling live.
-// Dodatki: stabilniejsze połączenia (lista hostów), /admin/ws-diag, bogatsze logi.
+// server.js  (ESM) — Kick echo bot + OAuth + WS z obejściem DNS (DoH)
+// Funkcje: OAuth (/oauth|/auth/start|callback), /chat/test, echo po X powtórzeniach,
+// polling live, /admin/ws-listen, /admin/ws-diag, /admin/debug.
 
 import "dotenv/config";
 import express from "express";
@@ -11,17 +11,14 @@ import fs from "fs";
 import path from "path";
 import { io } from "socket.io-client";
 
-/* ---------- stałe/nagłówki ---------- */
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 const JSON_HEADERS = { "User-Agent": UA, Accept: "application/json, text/plain, */*", Referer: "https://kick.com/" };
 const HTML_HEADERS = { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", Referer: "https://kick.com/" };
 
-/* ---------- ENV ---------- */
 const {
   PORT = 3100,
 
-  // OAuth / Kick
   KICK_CLIENT_ID = "",
   KICK_CLIENT_SECRET = "",
   KICK_REDIRECT_URI = "",
@@ -29,14 +26,12 @@ const {
   TOKEN_URL = "https://id.kick.com/oauth/token",
   KICK_OAUTH_PREFIX = "/oauth",
 
-  // Kanały / bot
   ALLOWED_SLUGS = "",
   BOT_USERNAME = "",
   CHATROOM_ID_OVERRIDES = "",
   ADMIN_KEY = "",
   SUBSCRIBE_KEY = "",
 
-  // Echo
   CMD_ECHO_ENABLED = "true",
   CMD_ECHO_MIN_RUN,
   ECHO_THRESHOLD,
@@ -44,21 +39,19 @@ const {
   IGNORE_EXACT = "",
   CMD_ECHO_EXCLUDE = "",
 
-  // pliki/tokeny
   TOKENS_PATH = "/tmp/kick_tokens.json",
   DATA_DIR = "/tmp",
   KICK_REFRESH_TOKEN = "",
 
-  // polling (live on/off)
   POLL_SECONDS = "60",
 
-  // WebSocket/Socket.IO hosty (domyślnie tylko wss)
+  // hosty WS (bez https://kick.com)
   KICK_WS_URL = "",
   KICK_WS_URLS = "wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com",
   WS_INSECURE = "false",
 } = process.env;
 
-/* ---------- parse ENV ---------- */
+/* ------------ ENV parse ------------ */
 const allowedSlugs = String(ALLOWED_SLUGS || "")
   .split(",")
   .map((s) => s.trim().toLowerCase())
@@ -81,37 +74,19 @@ const WS_CANDIDATES = [
   .map((s) => s.trim())
   .filter(Boolean);
 
-/* ---------- pliki ---------- */
+/* ------------ pliki ------------ */
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const TOKENS_FILE = TOKENS_PATH || path.join(DATA_DIR, "tokens.json");
 const PKCE_FILE = path.join(DATA_DIR, "pkce.json");
 
-/* ---------- express ---------- */
+/* ------------ express ------------ */
 const app = express();
-app.use(
-  bodyParser.json({
-    verify: (req, _res, buf) => (req.rawBody = buf),
-  })
-);
-app.use(
-  bodyParser.urlencoded({
-    extended: true,
-    verify: (req, _res, buf) => (req.rawBody = buf),
-  })
-);
+app.use(bodyParser.json({ verify: (req, _res, buf) => (req.rawBody = buf) }));
+app.use(bodyParser.urlencoded({ extended: true, verify: (req, _res, buf) => (req.rawBody = buf) }));
 
-/* ---------- mount helpers ---------- */
-const mountGet = (p, h) => (Array.isArray(p) ? p : [p]).forEach((x) => app.get(x, h));
-const mountPost = (p, h) => (Array.isArray(p) ? p : [p]).forEach((x) => app.post(x, h));
-
-/* ---------- tokeny ---------- */
+/* ------------ tokeny ------------ */
 let tokens = { access_token: null, refresh_token: null, expires_at: 0 };
-
-const saveTokens = () => {
-  try {
-    fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
-  } catch {}
-};
+const saveTokens = () => { try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2)); } catch {} };
 (function loadTokens() {
   try {
     if (fs.existsSync(TOKENS_FILE)) {
@@ -125,7 +100,7 @@ const saveTokens = () => {
 async function refreshIfNeeded() {
   const now = Math.floor(Date.now() / 1000);
   if (tokens.access_token && now < Number(tokens.expires_at || 0) - 60) return tokens.access_token;
-  if (!tokens.refresh_token) throw new Error("Brak refresh_token – zrób /oauth/start (lub /auth/start)");
+  if (!tokens.refresh_token) throw new Error("Brak refresh_token – uruchom /oauth/start (lub /auth/start)");
 
   const params = new URLSearchParams();
   params.append("grant_type", "refresh_token");
@@ -145,7 +120,7 @@ async function refreshIfNeeded() {
   return tokens.access_token;
 }
 
-/* ---------- app token ---------- */
+/* ------------ app token ------------ */
 let appToken = { token: null, expires_at: 0 };
 async function getAppToken() {
   const now = Math.floor(Date.now() / 1000);
@@ -166,8 +141,8 @@ async function getAppToken() {
   return appToken.token;
 }
 
-/* ---------- kanały ---------- */
-const channelIdCache = new Map(); // slug -> broadcaster_user_id
+/* ------------ kanały ------------ */
+const channelIdCache = new Map();
 
 async function getChannelsBySlugs(slugs) {
   const list = (Array.isArray(slugs) ? slugs : [slugs])
@@ -212,7 +187,7 @@ async function getChannelsBySlugs(slugs) {
   return [];
 }
 
-/* ---------- wysyłanie wiadomości ---------- */
+/* ------------ wysyłanie wiadomości ------------ */
 async function sendChatMessage({ broadcaster_user_id, content, type = "user" }) {
   const token = await refreshIfNeeded();
   await axios.post(
@@ -223,7 +198,7 @@ async function sendChatMessage({ broadcaster_user_id, content, type = "user" }) 
   markEchoSent(broadcaster_user_id, content);
 }
 
-/* ---------- echo ---------- */
+/* ------------ echo ------------ */
 const echoEnabled = String(CMD_ECHO_ENABLED).toLowerCase() === "true";
 const echoMinRun = Math.max(2, Number(CMD_ECHO_MIN_RUN ?? ECHO_THRESHOLD ?? 5));
 const echoCooldownMs = Math.max(5, Number(CMD_ECHO_COOLDOWN_SECONDS) || 60) * 1000;
@@ -249,7 +224,25 @@ function wasEchoSentRecently(id, content) {
   return Boolean(ts && Date.now() - ts < 30_000);
 }
 
-/* ---------- WS/Socket.IO czatu ---------- */
+/* ------------ DoH resolver (Cloudflare/Google) ------------ */
+async function dohResolveA(host) {
+  const cfUrl = "https://cloudflare-dns.com/dns-query";
+  const gUrl = "https://dns.google/resolve";
+  const headers = { "User-Agent": UA, Accept: "application/dns-json" };
+  try {
+    const { data } = await axios.get(cfUrl, { params: { name: host, type: "A" }, headers, timeout: 8000 });
+    const ip = (data?.Answer || []).find((a) => a.type === 1)?.data;
+    if (ip) return ip;
+  } catch {}
+  try {
+    const { data } = await axios.get(gUrl, { params: { name: host, type: "A" }, headers, timeout: 8000 });
+    const ip = (data?.Answer || []).find((a) => a.type === 1)?.data;
+    if (ip) return ip;
+  } catch {}
+  return null;
+}
+
+/* ------------ WS/Socket.IO czatu (z obejściem DNS) ------------ */
 const wsBySlug = new Map();
 const missingChatLogOnce = new Set();
 
@@ -333,7 +326,7 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
   if (wsBySlug.has(slug)) return;
 
   getChannelWithChatroom(slug)
-    .then(({ chatroom_id }) => {
+    .then(async ({ chatroom_id }) => {
       if (!chatroom_id) {
         if (!missingChatLogOnce.has(slug)) {
           console.warn(`Brak chatroom_id dla ${slug}`);
@@ -353,62 +346,65 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
       let idx = 0;
       let socket = null;
 
-      const connect = () => {
-        const url = urls[idx % urls.length];
-        const isHttp = /^https:\/\//i.test(url);
+      const connect = async () => {
+        const rawUrl = urls[idx % urls.length];
+        const u = new URL(rawUrl);
+        const host = u.hostname; // ws1.chat.kick.com itp.
 
+        // Rozwiąż host -> IP przez DoH (HTTPS) aby ominąć ENOTFOUND
+        const ip = await dohResolveA(host);
+        let connectUrl = rawUrl;
         const headers = {
           "User-Agent": UA,
           Origin: `https://kick.com/${slug}`,
           Referer: `https://kick.com/${slug}`,
+          Host: host, // ważne przy łączeniu po IP
         };
 
-        socket = io(url, {
-          transports: isHttp ? ["polling", "websocket"] : ["websocket"],
+        const transportOptions = {
+          polling: { extraHeaders: headers },
+          websocket: { extraHeaders: headers, servername: host },
+        };
+
+        // jeśli mamy IP — łączymy się po IP, ale SNI/Host zostaje na host
+        if (ip) connectUrl = `${u.protocol}//${ip}${u.pathname}`;
+
+        socket = io(connectUrl, {
+          transports: ["websocket"], // najpewniejsze pod WS
           path: "/socket.io",
           forceNew: true,
           reconnection: true,
           reconnectionDelayMax: 15000,
           timeout: 15000,
           withCredentials: true,
-
-          // nagłówki również dla pollingu i upgradu WS
           extraHeaders: headers,
-          transportOptions: {
-            polling:   { extraHeaders: headers },
-            websocket: { extraHeaders: headers },
-          },
-
+          transportOptions,
           rejectUnauthorized: String(WS_INSECURE).toLowerCase() === "true" ? false : true,
         });
+
         wsBySlug.set(slug, socket);
 
         socket.on("connect", () => {
           try {
             socket.emit("SUBSCRIBE", { room: `chatrooms:${chatroom_id}` });
-            console.log(`WS connected for ${slug} via ${url} -> chatrooms:${chatroom_id}`);
+            console.log(`WS connected for ${slug} via ${rawUrl} (${ip || "no-ip"}) -> chatrooms:${chatroom_id}`);
           } catch (e) {
             console.warn("WS subscribe error:", e?.message || e);
           }
         });
 
-        socket.on("connect_error", (err) => {
+        const retry = (label, err) => {
           const msg = err?.message || err?.data || (typeof err === "string" ? err : JSON.stringify(err || {}));
           const ctx = err?.context ? JSON.stringify(err.context) : "";
-          console.error("WS connect_error", { slug, url, msg, ctx });
+          console.error(label, { slug, url: rawUrl, msg, ctx });
           try { socket?.close?.(); } catch {}
           idx += 1;
           setTimeout(connect, 1500);
-        });
+        };
 
-        socket.on("error", (err) => {
-          const msg = err?.message || (typeof err === "string" ? err : JSON.stringify(err || {}));
-          console.error("WS error", slug, msg);
-        });
-
-        socket.on("disconnect", (reason) => {
-          console.warn(`WS disconnected for ${slug}: ${reason}`);
-        });
+        socket.on("connect_error", (err) => retry("WS connect_error", err));
+        socket.on("error", (err) => console.error("WS error", slug, err?.message || err));
+        socket.on("disconnect", (reason) => console.warn(`WS disconnected for ${slug}: ${reason}`));
 
         const onMsg = async (payload) => {
           try {
@@ -423,15 +419,12 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
 
             const st = echoStateByChannel.get(broadcaster_user_id) || { current: "", count: 0, lastSentAt: 0 };
             if (st.current === lower) st.count += 1;
-            else {
-              st.current = lower;
-              st.count = 1;
-            }
+            else { st.current = lower; st.count = 1; }
 
             const now = Date.now();
             if (st.count >= echoMinRun && now - st.lastSentAt > echoCooldownMs) {
               try {
-                await sendChatMessage({ broadcaster_user_id, content, type: "user" });
+                await sendChatMessage({ broadcaster_user_id: broadcaster_user_id, content, type: "user" });
                 st.lastSentAt = now;
                 st.count = 0;
               } catch (e) {
@@ -451,7 +444,7 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
     .catch((e) => console.error("ensureWsListener error:", e?.message || e));
 }
 
-/* ---------- polling live on/off ---------- */
+/* ------------ polling live ------------ */
 const pollMs = Math.max(30, Number(POLL_SECONDS) || 60) * 1000;
 async function pollingTick() {
   try {
@@ -471,7 +464,7 @@ async function pollingTick() {
   }
 }
 
-/* ---------- OAuth START / CALLBACK (obsługujemy /oauth/*, /auth/* i bez prefixu) ---------- */
+/* ------------ OAuth (start/callback, aliasy) ------------ */
 function buildAuthorizeURL(state, codeChallenge) {
   const params = new URLSearchParams({
     response_type: "code",
@@ -488,10 +481,10 @@ function buildAuthorizeURL(state, codeChallenge) {
 const startPaths = [`${KICK_OAUTH_PREFIX}/start`, "/oauth/start", "/auth/start", "/start"];
 const callbackPaths = [`${KICK_OAUTH_PREFIX}/callback`, "/oauth/callback", "/auth/callback", "/callback"];
 
-mountGet(startPaths, (_req, res) => {
+app.get(startPaths, (_req, res) => {
   if (!KICK_CLIENT_ID) return res.status(400).send("Missing KICK_CLIENT_ID");
   const verifier = crypto.randomBytes(32).toString("base64url");
-  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest().toString("base64url");
   const state = crypto.randomBytes(8).toString("hex");
 
   let store = {};
@@ -502,7 +495,7 @@ mountGet(startPaths, (_req, res) => {
   res.redirect(buildAuthorizeURL(state, challenge));
 });
 
-mountGet(callbackPaths, async (req, res) => {
+app.get(callbackPaths, async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
     if (error) return res.status(400).send(`OAuth error: ${error} ${error_description || ""}`);
@@ -539,7 +532,7 @@ mountGet(callbackPaths, async (req, res) => {
   }
 });
 
-/* ---------- REST pomocnicze ---------- */
+/* ------------ REST pomocnicze ------------ */
 app.get("/health", (_req, res) => res.send("ok"));
 
 app.get("/tokens", (_req, res) => {
@@ -550,30 +543,18 @@ app.get("/tokens", (_req, res) => {
   res.json({ has_access_token, has_refresh_token, token_type, expires_in, scope: "user:read chat:write" });
 });
 
-/* --- DIAG: sprawdza engine.io (polling) na hostach --- */
+/* Diagnostyka WS (po DoH nie będzie ENOTFOUND, ale sprawdzamy odpowiedź) */
 app.get("/admin/ws-diag", async (req, res) => {
   try {
     const slug = String(req.query.slug || (ALLOWED_SLUGS.split(",")[0] || "")).toLowerCase();
     const hosts = (process.env.KICK_WS_URL || process.env.KICK_WS_URLS || "wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com")
       .split(",").map(s => s.trim()).filter(Boolean);
+
     const results = [];
-    for (const host of hosts) {
-      const https = host.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
-      const url = `${https}/socket.io/?EIO=4&transport=polling&t=${Date.now()}`;
-      try {
-        const r = await axios.get(url, {
-          timeout: 8000,
-          headers: { Origin: `https://kick.com/${slug}`, Referer: `https://kick.com/${slug}`, "User-Agent": UA }
-        });
-        results.push({ host, ok: true, status: r.status, data: String(r.data).slice(0,120) });
-      } catch (e) {
-        results.push({
-          host, ok: false,
-          status: e?.response?.status || null,
-          error: e?.message || String(e),
-          body: e?.response?.data ? String(e.response.data).slice(0,120) : null
-        });
-      }
+    for (const raw of hosts) {
+      const h = new URL(raw).hostname;
+      const ip = await dohResolveA(h);
+      results.push({ host: h, ip: ip || null, ok: Boolean(ip) });
     }
     res.json({ slug, results });
   } catch (e) {
@@ -621,7 +602,7 @@ app.get("/admin/ws-listen", async (req, res) => {
   }
 });
 
-/* Admin: szybki debug (chatroom_id, itp.) */
+/* Admin: szybki debug (chatroom_id itp.) */
 app.get("/admin/debug", async (req, res) => {
   try {
     const slug = String(req.query.slug || allowedSlugs[0] || "").toLowerCase();
@@ -633,7 +614,7 @@ app.get("/admin/debug", async (req, res) => {
 });
 
 /* Chat test – GET i POST */
-mountGet("/chat/test", async (req, res) => {
+app.get("/chat/test", async (req, res) => {
   try {
     const slug = String(req.query.slug || allowedSlugs[0] || "").toLowerCase();
     const text = String(req.query.text || req.query.msg || "siema").slice(0, 280);
@@ -649,7 +630,7 @@ mountGet("/chat/test", async (req, res) => {
     res.json({ ok: false, error: e?.response?.data || e.message });
   }
 });
-mountPost("/chat/test", async (req, res) => {
+app.post("/chat/test", async (req, res) => {
   try {
     const body = req.body || {};
     const slug = String(body.slug || allowedSlugs[0] || "").toLowerCase();
@@ -667,8 +648,8 @@ mountPost("/chat/test", async (req, res) => {
   }
 });
 
-/* Subskrypcje (opcjonalnie) */
-mountPost("/subscribe", async (_req, res) => {
+/* Subskrypcje (opcjonalne) */
+app.post("/subscribe", async (_req, res) => {
   try {
     const token = await refreshIfNeeded();
     const { data } = await axios.post(
@@ -681,7 +662,7 @@ mountPost("/subscribe", async (_req, res) => {
     res.status(e?.response?.status || 500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
-mountGet("/subscribe", async (req, res) => {
+app.get("/subscribe", async (req, res) => {
   try {
     if (SUBSCRIBE_KEY) {
       if (req.query.key !== SUBSCRIBE_KEY) return res.status(403).send("Forbidden");
@@ -700,7 +681,7 @@ mountGet("/subscribe", async (req, res) => {
   }
 });
 
-/* ---------- start ---------- */
+/* ------------ start ------------ */
 app.listen(PORT, () => {
   console.log(`auth+bot app listening on :${PORT}`);
   console.log(`Using OAuth prefix: ${KICK_OAUTH_PREFIX} (authorize: ${AUTH_URL})`);
