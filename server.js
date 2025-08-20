@@ -1,5 +1,5 @@
-// server.js — Kick echo bot (ESM)
-// Wymagane "type":"module" w package.json
+// server.js — Kick echo bot (ESM). Logika bez zmian: echo po N powtórzeniach !komendy.
+// Wymaga "type": "module" w package.json.
 
 import "dotenv/config";
 import express from "express";
@@ -10,10 +10,19 @@ import fs from "fs";
 import path from "path";
 import { io } from "socket.io-client";
 
-/* ---------- Nagłówki ---------- */
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-const JSON_HEADERS = { "User-Agent": UA, Accept: "application/json, text/plain, */*", Referer: "https://kick.com/" };
-const HTML_HEADERS = { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", Referer: "https://kick.com/" };
+/* ---------- Stałe / headers ---------- */
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+const JSON_HEADERS = {
+  "User-Agent": UA,
+  Accept: "application/json, text/plain, */*",
+  Referer: "https://kick.com/",
+};
+const HTML_HEADERS = {
+  "User-Agent": UA,
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  Referer: "https://kick.com/",
+};
 
 /* ---------- ENV ---------- */
 const {
@@ -30,15 +39,17 @@ const {
   // Bot
   ALLOWED_SLUGS = "",
   BOT_USERNAME = "",
-  CHATROOM_ID_OVERRIDES = "",
+  CHATROOM_ID_OVERRIDES = "", // np. "holly-s:56494133"
   ADMIN_KEY = "",
   SUBSCRIBE_KEY = "",
 
-  // Echo
+  // Echo (zostają aliasy, by nic nie „pękło”)
   CMD_ECHO_ENABLED = "true",
   CMD_ECHO_MIN_RUN,
+  ECHO_THRESHOLD, // alias
   CMD_ECHO_COOLDOWN_SECONDS = "60",
   CMD_ECHO_EXCLUDE = "",
+  IGNORE_EXACT = "", // alias
 
   // Tokeny / pliki
   DATA_DIR = "/tmp",
@@ -51,12 +62,16 @@ const {
 
 /* ---------- Helpers ---------- */
 const allowedSlugs = String(ALLOWED_SLUGS || "")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
 const CHATROOM_OVERRIDES = String(CHATROOM_ID_OVERRIDES || "")
-  .split(",").map(s => s.trim()).filter(Boolean)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
   .reduce((acc, pair) => {
-    const [slug, id] = pair.split(":").map(x => (x || "").trim());
+    const [slug, id] = pair.split(":").map((x) => (x || "").trim());
     if (slug && id && /^\d+$/.test(id)) acc[slug.toLowerCase()] = Number(id);
     return acc;
   }, {});
@@ -75,15 +90,29 @@ const TOKENS_FILE = TOKENS_PATH || path.join(DATA_DIR, "tokens.json");
 
 /* ---------- Express ---------- */
 const app = express();
-app.use(bodyParser.json({ verify: (req, _res, buf) => (req.rawBody = buf) }));
-app.use(bodyParser.urlencoded({ extended: true, verify: (req, _res, buf) => (req.rawBody = buf) }));
+app.use(
+  bodyParser.json({
+    verify: (req, _res, buf) => (req.rawBody = buf),
+  })
+);
+app.use(
+  bodyParser.urlencoded({
+    extended: true,
+    verify: (req, _res, buf) => (req.rawBody = buf),
+  })
+);
 
-const mountGet  = (p, h) => (Array.isArray(p) ? p : [p]).forEach(x => app.get(x, h));
-const mountPost = (p, h) => (Array.isArray(p) ? p : [p]).forEach(x => app.post(x, h));
+const mountGet = (p, h) => (Array.isArray(p) ? p : [p]).forEach((x) => app.get(x, h));
+const mountPost = (p, h) => (Array.isArray(p) ? p : [p]).forEach((x) => app.post(x, h));
 
 /* ---------- Tokeny użytkownika ---------- */
 let tokens = { access_token: null, refresh_token: null, expires_at: 0 };
-const saveTokens = () => { try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2)); } catch {} };
+
+const saveTokens = () => {
+  try {
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
+  } catch {}
+};
 (function loadTokens() {
   try {
     if (fs.existsSync(TOKENS_FILE)) {
@@ -97,7 +126,7 @@ const saveTokens = () => { try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(to
 async function refreshIfNeeded() {
   const now = Math.floor(Date.now() / 1000);
   if (tokens.access_token && now < Number(tokens.expires_at || 0) - 60) return tokens.access_token;
-  if (!tokens.refresh_token) throw new Error("Brak refresh_token – odwiedź /auth/start");
+  if (!tokens.refresh_token) throw new Error("Brak refresh_token – przejdź /auth/start");
 
   const params = new URLSearchParams();
   params.append("grant_type", "refresh_token");
@@ -106,7 +135,8 @@ async function refreshIfNeeded() {
   params.append("refresh_token", tokens.refresh_token);
 
   const { data } = await axios.post(TOKEN_URL, params, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000,
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 15000,
   });
 
   tokens.access_token = data.access_token;
@@ -128,7 +158,8 @@ async function getAppToken() {
   params.append("client_secret", KICK_CLIENT_SECRET);
 
   const { data } = await axios.post(TOKEN_URL, params, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000,
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 15000,
   });
 
   appToken.token = data.access_token;
@@ -141,7 +172,8 @@ const channelIdCache = new Map(); // slug -> broadcaster_user_id
 
 async function getChannelsBySlugs(slugs) {
   const base = (Array.isArray(slugs) ? slugs : [slugs])
-    .map(s => String(s || "").trim().toLowerCase()).filter(Boolean);
+    .map((s) => String(s || "").trim().toLowerCase())
+    .filter(Boolean);
   if (!base.length) return [];
 
   const list = Array.from(new Set(base.flatMap(altSlugs)));
@@ -165,7 +197,7 @@ async function getChannelsBySlugs(slugs) {
   }
 
   try {
-    const qs = list.map(s => `slug=${encodeURIComponent(s)}`).join("&");
+    const qs = list.map((s) => `slug=${encodeURIComponent(s)}`).join("&");
     const { data } = await axios.get(`${baseUrl}?${qs}`, { headers, timeout });
     if (Array.isArray(data?.data) && data.data.length) {
       for (const ch of data.data) channelIdCache.set(ch.slug, ch.broadcaster_user_id);
@@ -174,7 +206,7 @@ async function getChannelsBySlugs(slugs) {
   } catch {}
 
   try {
-    const qs = list.map(s => `slug[]=${encodeURIComponent(s)}`).join("&");
+    const qs = list.map((s) => `slug[]=${encodeURIComponent(s)}`).join("&");
     const { data } = await axios.get(`${baseUrl}?${qs}`, { headers, timeout });
     if (Array.isArray(data?.data) && data.data.length) {
       for (const ch of data.data) channelIdCache.set(ch.slug, ch.broadcaster_user_id);
@@ -196,15 +228,19 @@ async function sendChatMessage({ broadcaster_user_id, content, type = "user" }) 
   markEchoSent(broadcaster_user_id, content);
 }
 
-/* ---------- ECHO ---------- */
-const echoEnabled   = String(CMD_ECHO_ENABLED).toLowerCase() === "true";
-const echoMinRun    = Math.max(2, Number(CMD_ECHO_MIN_RUN ?? 5));
+/* ---------- Echo ---------- */
+const echoEnabled = String(CMD_ECHO_ENABLED).toLowerCase() === "true";
+const echoMinRun = Math.max(2, Number(CMD_ECHO_MIN_RUN ?? ECHO_THRESHOLD ?? 5)); // alias wspierany
 const echoCooldownMs = Math.max(5, Number(CMD_ECHO_COOLDOWN_SECONDS) || 60) * 1000;
-const echoExclude   = new Set(String(CMD_ECHO_EXCLUDE || "")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+const echoExclude = new Set(
+  String(CMD_ECHO_EXCLUDE || IGNORE_EXACT || "") // alias wspierany
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
 
 const echoStateByChannel = new Map(); // id -> { current, count, lastSentAt }
-const echoRecentSent     = new Map(); // id -> Map<content, ts>
+const echoRecentSent = new Map(); // id -> Map<content, ts>
 function markEchoSent(id, content) {
   const m = echoRecentSent.get(id) || new Map();
   m.set(content, Date.now());
@@ -217,7 +253,7 @@ const wasEchoSentRecently = (id, content) => {
   return Boolean(ts && Date.now() - ts < 30_000);
 };
 
-/* ---------- WS + chatroom ---------- */
+/* ---------- WS czatu ---------- */
 const wsBySlug = new Map();
 const missingChatLogOnce = new Set();
 
@@ -227,7 +263,7 @@ async function getChannelWithChatroom(slugRaw) {
   let chatroom_id = null;
   let usedSlug = variants[0];
 
-  // override
+  // 0) override
   for (const v of variants) {
     if (CHATROOM_OVERRIDES[v]) {
       usedSlug = v;
@@ -239,7 +275,7 @@ async function getChannelWithChatroom(slugRaw) {
     }
   }
 
-  // public/v1
+  // 1) public/v1
   for (const v of variants) {
     try {
       const byV1 = (await getChannelsBySlugs([v]))?.[0] || null;
@@ -253,10 +289,13 @@ async function getChannelWithChatroom(slugRaw) {
     } catch {}
   }
 
-  // api/v2 JSON
+  // 2) api/v2 JSON
   for (const v of variants) {
     try {
-      const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(v)}`, { timeout: 15000, headers: JSON_HEADERS });
+      const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(v)}`, {
+        timeout: 15000,
+        headers: JSON_HEADERS,
+      });
       if (data) {
         usedSlug = v;
         chatroom_id = data?.chatroom?.id ?? data?.data?.chatroom?.id ?? null;
@@ -268,31 +307,54 @@ async function getChannelWithChatroom(slugRaw) {
     } catch {}
   }
 
-  // api/v2 HTML (tekst)
+  // 3) api/v2 jako tekst (HTML/JSON)
   for (const v of variants) {
     try {
-      const { data: raw } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(v)}`, { timeout: 15000, headers: HTML_HEADERS, responseType: "text" });
+      const { data: raw } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(v)}`, {
+        timeout: 15000,
+        headers: HTML_HEADERS,
+        responseType: "text",
+      });
       let m = /"chatroom"\s*:\s*\{\s*"id"\s*:\s*(\d+)/.exec(raw) || /"chatroom_id"\s*:\s*(\d+)/.exec(raw);
-      if (m) { usedSlug = v; chatroom_id = Number(m[1]); return { usedSlug, ch, chatroom_id }; }
+      if (m) {
+        usedSlug = v;
+        chatroom_id = Number(m[1]);
+        return { usedSlug, ch, chatroom_id };
+      }
     } catch {}
   }
 
-  // /chatroom
+  // 4) /chatroom
   for (const v of variants) {
     try {
-      const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(v)}/chatroom`, { timeout: 15000, headers: JSON_HEADERS });
-      if (data?.id) { usedSlug = v; chatroom_id = data.id; return { usedSlug, ch, chatroom_id }; }
+      const { data } = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(v)}/chatroom`, {
+        timeout: 15000,
+        headers: JSON_HEADERS,
+      });
+      if (data?.id) {
+        usedSlug = v;
+        chatroom_id = data.id;
+        return { usedSlug, ch, chatroom_id };
+      }
     } catch {}
   }
 
-  // Strona kanału (HTML) — spróbuj też user_id
+  // 5) strona kanału — fallback + próba user_id
   for (const v of variants) {
     try {
-      const { data: html } = await axios.get(`https://kick.com/${encodeURIComponent(v)}`, { timeout: 15000, headers: HTML_HEADERS, responseType: "text" });
+      const { data: html } = await axios.get(`https://kick.com/${encodeURIComponent(v)}`, {
+        timeout: 15000,
+        headers: HTML_HEADERS,
+        responseType: "text",
+      });
       let m = /"chatroom"\s*:\s*\{\s*"id"\s*:\s*(\d+)/.exec(html) || /"chatroom_id"\s*:\s*(\d+)/.exec(html);
       const u = /"user_id"\s*:\s*(\d+)/.exec(html);
       if (u) channelIdCache.set(v, Number(u[1]));
-      if (m) { usedSlug = v; chatroom_id = Number(m[1]); return { usedSlug, ch, chatroom_id }; }
+      if (m) {
+        usedSlug = v;
+        chatroom_id = Number(m[1]);
+        return { usedSlug, ch, chatroom_id };
+      }
     } catch {}
   }
 
@@ -304,122 +366,192 @@ function ensureWsListener(slugRaw, broadcaster_user_id_hint) {
   const slug = String(slugRaw || "").toLowerCase();
   if (wsBySlug.has(slug)) return;
 
-  getChannelWithChatroom(slug).then(({ usedSlug, ch, chatroom_id }) => {
-    if (!chatroom_id) {
-      if (!missingChatLogOnce.has(slug)) { console.warn(`Brak chatroom_id dla ${slug}`); missingChatLogOnce.add(slug); }
-      setTimeout(() => { wsBySlug.delete(slug); ensureWsListener(slug, broadcaster_user_id_hint); }, 60_000);
-      return;
-    }
-
-    const broadcaster_user_id =
-      ch?.broadcaster_user_id ||
-      channelIdCache.get(usedSlug) ||
-      channelIdCache.get(slug) ||
-      broadcaster_user_id_hint || 0;
-
-    if (broadcaster_user_id) {
-      channelIdCache.set(slug, broadcaster_user_id);
-      channelIdCache.set(usedSlug, broadcaster_user_id);
-    } else {
-      console.warn(`Brak broadcaster_user_id dla ${slug} – echo nie wyśle wiadomości`);
-    }
-
-    const socket = io("https://chat.kick.com", {
-      transports: ["websocket"],
-      path: "/socket.io",
-      forceNew: true,
-      reconnection: true,
-      reconnectionDelayMax: 15000,
-    });
-    wsBySlug.set(slug, socket);
-
-    socket.on("connect", () => {
-      try {
-        socket.emit("JOIN", { room: `chatrooms:${chatroom_id}` });
-        socket.emit("SUBSCRIBE", { room: `chatrooms:${chatroom_id}` });
-      } catch {}
-      console.log(`WS connected for ${slug} -> chatrooms:${chatroom_id} (uid=${broadcaster_user_id || "?"})`);
-    });
-    socket.on("connect_error", (err) => console.error("WS connect_error", slug, err?.message || err));
-    socket.on("error",        (err) => console.error("WS error", slug, err?.message || err));
-    socket.on("disconnect",   () => console.log(`WS disconnected for ${slug}`));
-
-    const normalizeContent = (payload) => {
-      try {
-        let p = payload;
-        if (typeof p === "string") { try { p = JSON.parse(p); } catch {} }
-        if (p?.data && typeof p.data === "string") { try { p = JSON.parse(p.data); } catch {} }
-        const text =
-          p?.message?.content ??
-          p?.message?.text ??
-          p?.content ??
-          (Array.isArray(p?.segments) ? p.segments.map(s => s?.text || "").join("") : "");
-        return (text && String(text).trim()) || null;
-      } catch { return null; }
-    };
-
-    const echoHandler = async (content) => {
-      const id = broadcaster_user_id || channelIdCache.get(slug) || channelIdCache.get(usedSlug) || 0;
-      const lower = content.toLowerCase();
-      if (!lower.startsWith("!")) return;
-      if (echoExclude.has(lower)) return;
-      if (wasEchoSentRecently(id, content)) return;
-
-      const st = echoStateByChannel.get(id) || { current: "", count: 0, lastSentAt: 0 };
-      if (st.current === lower) st.count += 1; else { st.current = lower; st.count = 1; }
-
-      const now = Date.now();
-      if (st.count >= echoMinRun && now - st.lastSentAt > echoCooldownMs && id) {
-        console.log(`Echo TRIGGER for ${slug} (uid=${id}):`, content);
-        try {
-          await sendChatMessage({ broadcaster_user_id: id, content, type: "user" });
-          st.lastSentAt = now; st.count = 0;
-        } catch (e) {
-          console.warn("Echo send error:", e?.response?.status || e?.message);
+  getChannelWithChatroom(slug)
+    .then(({ usedSlug, ch, chatroom_id }) => {
+      if (!chatroom_id) {
+        if (!missingChatLogOnce.has(slug)) {
+          console.warn(`Brak chatroom_id dla ${slug}`);
+          missingChatLogOnce.add(slug);
         }
+        setTimeout(() => {
+          wsBySlug.delete(slug);
+          ensureWsListener(slug, broadcaster_user_id_hint);
+        }, 60_000);
+        return;
       }
-      echoStateByChannel.set(id, st);
-    };
 
-    // Łapiemy WS niezależnie od nazw eventów
-    socket.onAny((event, payload) => {
-      const name = String(event || "").toLowerCase();
-      if (!name.includes("chat")) return;
-      const content = normalizeContent(payload);
-      if (content) echoHandler(content);
-    });
+      const broadcaster_user_id =
+        ch?.broadcaster_user_id ||
+        channelIdCache.get(usedSlug) ||
+        channelIdCache.get(slug) ||
+        broadcaster_user_id_hint ||
+        0;
 
-    // Legacy
-    const onMsgLegacy = (payload) => {
-      const content = normalizeContent(payload);
-      if (content) echoHandler(content);
-    };
-    socket.on("message", onMsgLegacy);
-    socket.on("chat_message", onMsgLegacy);
-  }).catch(() => {});
+      if (broadcaster_user_id) {
+        channelIdCache.set(slug, broadcaster_user_id);
+        channelIdCache.set(usedSlug, broadcaster_user_id);
+      } else {
+        console.warn(`Brak broadcaster_user_id dla ${slug} – echo nie wyśle wiadomości`);
+      }
+
+      const socket = io("https://chat.kick.com", {
+        transports: ["websocket"],
+        path: "/socket.io",
+        forceNew: true,
+        reconnection: true,
+        reconnectionDelayMax: 15000,
+        // podajemy nagłówki — Kick WS bywa surowy
+        extraHeaders: {
+          Origin: "https://kick.com",
+          Referer: `https://kick.com/${usedSlug}`,
+          "User-Agent": UA,
+        },
+      });
+      wsBySlug.set(slug, socket);
+
+      socket.on("connect", () => {
+        try {
+          // dwa warianty subskrypcji
+          socket.emit("JOIN", { room: `chatrooms:${chatroom_id}` });
+        } catch {}
+        try {
+          socket.emit("SUBSCRIBE", { room: `chatrooms:${chatroom_id}` });
+        } catch {}
+        console.log(`WS connected for ${slug} -> chatrooms:${chatroom_id} (uid=${broadcaster_user_id || "?"})`);
+      });
+
+      socket.on("connect_error", (err) => {
+        console.warn("WS connect_error", slug, err?.message || err);
+        try {
+          socket.close();
+        } catch {}
+        wsBySlug.delete(slug); // nie spamuj retry — poczekaj na LIVE (polling)
+      });
+
+      socket.on("error", (err) => console.error("WS error", slug, err?.message || err));
+      socket.on("disconnect", () => console.log(`WS disconnected for ${slug}`));
+
+      // Normalizacja treści wiadomości
+      const normalizeContent = (payload) => {
+        try {
+          let p = payload;
+          if (typeof p === "string") {
+            try {
+              p = JSON.parse(p);
+            } catch {}
+          }
+          if (p?.data && typeof p.data === "string") {
+            try {
+              p = JSON.parse(p.data);
+            } catch {}
+          }
+          const text =
+            p?.message?.content ??
+            p?.message?.text ??
+            p?.content ??
+            (Array.isArray(p?.segments) ? p.segments.map((s) => s?.text || "").join("") : "");
+          return (text && String(text).trim()) || null;
+        } catch {
+          return null;
+        }
+      };
+
+      const echoHandler = async (content) => {
+        const id =
+          broadcaster_user_id ||
+          channelIdCache.get(slug) ||
+          channelIdCache.get(usedSlug) ||
+          0;
+
+        const lower = content.toLowerCase();
+        if (!lower.startsWith("!")) return;
+        if (echoExclude.has(lower)) return;
+        if (wasEchoSentRecently(id, content)) return;
+
+        const st = echoStateByChannel.get(id) || { current: "", count: 0, lastSentAt: 0 };
+        if (st.current === lower) st.count += 1;
+        else {
+          st.current = lower;
+          st.count = 1;
+        }
+
+        const now = Date.now();
+        if (st.count >= echoMinRun && now - st.lastSentAt > echoCooldownMs && id) {
+          console.log(`Echo TRIGGER for ${slug} (uid=${id}):`, content);
+          try {
+            await sendChatMessage({ broadcaster_user_id: id, content, type: "user" });
+            st.lastSentAt = now;
+            st.count = 0;
+          } catch (e) {
+            console.warn("Echo send error:", e?.response?.status || e?.message);
+          }
+        }
+        echoStateByChannel.set(id, st);
+      };
+
+      // Łap wszystkie eventy „chat*”
+      socket.onAny((event, payload) => {
+        const name = String(event || "").toLowerCase();
+        if (!name.includes("chat")) return;
+        const content = normalizeContent(payload);
+        if (content) echoHandler(content);
+      });
+
+      // Legacy nazwy
+      const onMsgLegacy = (payload) => {
+        const content = normalizeContent(payload);
+        if (content) echoHandler(content);
+      };
+      socket.on("message", onMsgLegacy);
+      socket.on("chat_message", onMsgLegacy);
+    })
+    .catch(() => {});
 }
 
-/* ---------- Polling (uruchamia WS) ---------- */
+/* ---------- Polling: uruchamiaj WS tylko gdy LIVE ---------- */
 const pollMs = Math.max(30, Number(POLL_SECONDS) || 60) * 1000;
 async function pollingTick() {
   try {
     if (!allowedSlugs.length) return;
     const chans = await getChannelsBySlugs(allowedSlugs);
     for (const ch of chans) {
-      const id   = ch.broadcaster_user_id;
+      const id = ch.broadcaster_user_id;
       const slug = String(ch.slug || "").toLowerCase();
-      if (id) channelIdCache.set(slug, id);
-      // i tak próbuj nasłuchu – część API nie podaje is_live
-      ensureWsListener(slug, id || 0);
+      const isLive = ch.stream?.is_live === true || ch?.is_live === true;
+
+      if (!id && channelIdCache.has(slug)) {
+        // nic
+      } else if (id) {
+        channelIdCache.set(slug, id);
+      }
+
+      if (isLive) {
+        ensureWsListener(slug, id || 0);
+      } else {
+        // jeśli OFFLINE – posprzątaj WS (żeby nie spamował)
+        const s = wsBySlug.get(slug);
+        if (s) {
+          try {
+            s.disconnect();
+          } catch {}
+          wsBySlug.delete(slug);
+        }
+      }
     }
   } catch (e) {
     console.error("Polling error:", e.message);
   }
 }
 
-/* ---------- OAuth: START/CALLBACK (PKCE w state) ---------- */
-const b64  = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
-const unb64 = (s)  => { try { return JSON.parse(Buffer.from(String(s), "base64url").toString("utf8")); } catch { return null; } };
+/* ---------- OAuth: START/CALLBACK (PKCE w state – bez plików) ---------- */
+const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+const unb64 = (s) => {
+  try {
+    return JSON.parse(Buffer.from(String(s), "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+};
 
 function buildAuthorizeURL(stateB64, codeChallenge) {
   const p = new URLSearchParams({
@@ -434,14 +566,14 @@ function buildAuthorizeURL(stateB64, codeChallenge) {
   return `${AUTH_URL}?${p.toString()}`;
 }
 
-const startPaths    = [ `${KICK_OAUTH_PREFIX}/start`, "/oauth/start", "/auth/start", "/start" ];
-const callbackPaths = [ `${KICK_OAUTH_PREFIX}/callback`, "/oauth/callback", "/auth/callback", "/callback" ];
+const startPaths = [`${KICK_OAUTH_PREFIX}/start`, "/oauth/start", "/auth/start", "/start"];
+const callbackPaths = [`${KICK_OAUTH_PREFIX}/callback`, "/oauth/callback", "/auth/callback", "/callback"];
 
 mountGet(startPaths, (_req, res) => {
   if (!KICK_CLIENT_ID) return res.status(400).send("Missing KICK_CLIENT_ID");
-  const verifier  = crypto.randomBytes(32).toString("base64url");
+  const verifier = crypto.randomBytes(32).toString("base64url");
   const challenge = crypto.createHash("sha256").update(verifier).digest().toString("base64url");
-  const stateB64  = b64({ s: crypto.randomBytes(8).toString("hex"), v: verifier });
+  const stateB64 = b64({ s: crypto.randomBytes(8).toString("hex"), v: verifier });
   res.redirect(buildAuthorizeURL(stateB64, challenge));
 });
 
@@ -464,7 +596,8 @@ mountGet(callbackPaths, async (req, res) => {
     });
 
     const { data } = await axios.post(TOKEN_URL, params, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 15000,
     });
 
     tokens.access_token = data.access_token;
@@ -483,7 +616,7 @@ mountGet(callbackPaths, async (req, res) => {
 app.get("/health", (_req, res) => res.send("ok"));
 
 app.get("/tokens", (_req, res) => {
-  const has_access_token  = Boolean(tokens?.access_token);
+  const has_access_token = Boolean(tokens?.access_token);
   const has_refresh_token = Boolean(tokens?.refresh_token);
   const token_type = has_access_token ? "Bearer" : null;
   const expires_in = has_access_token
@@ -499,7 +632,7 @@ app.get("/admin/send", async (req, res) => {
     if (!ADMIN_KEY || key !== ADMIN_KEY) return res.status(403).send("Forbidden");
 
     const slug = String(req.query.slug || allowedSlugs[0] || "").toLowerCase();
-    const msg  = String(req.query.msg || "TEST").slice(0, 280);
+    const msg = String(req.query.msg || "TEST").slice(0, 280);
     if (!slug) return res.status(400).json({ error: "Brak slug" });
 
     const chans = await getChannelsBySlugs([slug]);
@@ -513,7 +646,7 @@ app.get("/admin/send", async (req, res) => {
   }
 });
 
-/* Admin: wymuś WS nasłuch */
+/* Admin: wymuś WS nasłuch (użyj dopiero gdy LIVE) */
 app.get("/admin/ws-listen", async (req, res) => {
   try {
     const key = req.query.key || req.get("X-Admin-Key");
@@ -528,11 +661,11 @@ app.get("/admin/ws-listen", async (req, res) => {
     ensureWsListener(slug, id);
     res.json({ ok: true, listening: true, slug, id });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-/* Admin: debug */
+/* Admin: debug (sprawdza resolved ids) */
 app.get("/admin/debug", async (req, res) => {
   try {
     const key = req.query.key || req.get("X-Admin-Key");
@@ -618,6 +751,6 @@ mountGet("/subscribe", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`auth+bot app listening on :${PORT}`);
   console.log(`Using OAuth prefix: ${KICK_OAUTH_PREFIX} (authorize: ${AUTH_URL})`);
-  setInterval(pollingTick, Math.max(30, Number(POLL_SECONDS) || 60) * 1000);
+  setInterval(pollingTick, pollMs);
   pollingTick();
 });
