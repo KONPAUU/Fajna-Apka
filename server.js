@@ -353,25 +353,33 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
       const connect = () => {
         const url = urls[idx % urls.length];
         const isHttp = /^https:\/\//i.test(url);
+const isHttp = /^https:\/\//i.test(url);
 
-        const headers = {
-          "User-Agent": UA,
-          Origin: `https://kick.com/${slug}`,
-          Referer: `https://kick.com/${slug}`,
-        };
+const headers = {
+  "User-Agent": UA,
+  Origin: `https://kick.com/${slug}`,
+  Referer: `https://kick.com/${slug}`,
+};
 
-        socket = io(url, {
-          transports: isHttp ? ["polling", "websocket"] : ["websocket"], // HTTPS = pozwól na polling
-          path: "/socket.io",
-          forceNew: true,
-          reconnection: true,
-          reconnectionDelayMax: 15000,
-          timeout: 15000,
-          withCredentials: true,
-          extraHeaders: headers,
-          rejectUnauthorized: String(WS_INSECURE).toLowerCase() === "true" ? false : true,
-        });
+socket = io(url, {
+  transports: isHttp ? ["polling", "websocket"] : ["websocket"],
+  path: "/socket.io",
+  forceNew: true,
+  reconnection: true,
+  reconnectionDelayMax: 15000,
+  timeout: 15000,
+  withCredentials: true,
 
+  // BYŁO: extraHeaders: headers,
+  // DODANE: nagłówki także dla WS-upgrade i pollingu
+  extraHeaders: headers,
+  transportOptions: {
+    polling:   { extraHeaders: headers },
+    websocket: { extraHeaders: headers },
+  },
+
+  rejectUnauthorized: String(WS_INSECURE).toLowerCase() === "true" ? false : true,
+});
         wsBySlug.set(slug, socket);
 
         socket.on("connect", () => {
