@@ -1,6 +1,6 @@
 // server.js  (ESM) — Kick echo bot + OAuth
 // Logika bez zmian: OAuth, /chat/test, echo po X powtórzeniach, polling live.
-// Zmiany: stabilniejsze WS (kilka hostów), lepsze nagłówki i logi, aliasy /auth/*.
+// Zmiany: stabilniejsze WS (kilka hostów), lepsze nagłówki i logi, aliasy /auth/*, DIAG /admin/ws-diag.
 
 /* ---------- importy ---------- */
 import "dotenv/config";
@@ -360,7 +360,6 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
         const url = urls[idx % urls.length];
         const headers = {
           "User-Agent": UA,
-          // ważne: Origin/Referer konkretnie do kanału
           Origin: `https://kick.com/${slug}`,
           Referer: `https://kick.com/${slug}`,
         };
@@ -393,11 +392,9 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
             err?.message ||
             err?.data ||
             (typeof err === "string" ? err : JSON.stringify(err || {}));
-          console.error("WS connect_error", slug, msg);
-          // spróbuj następnego hosta po chwili
-          try {
-            socket?.close?.();
-          } catch {}
+          const ctx = err?.context ? JSON.stringify(err.context) : "";
+          console.error("WS connect_error", { slug, url, msg, ctx });
+          try { socket?.close?.(); } catch {}
           idx += 1;
           setTimeout(connect, 2000);
         });
@@ -409,7 +406,6 @@ function ensureWsListener(slugRaw, broadcaster_user_id) {
 
         socket.on("disconnect", (reason) => {
           console.warn(`WS disconnected for ${slug}: ${reason}`);
-          // pozwalamy socket.io samemu się połączyć, a jeśli cyklicznie błądzi — przeskoczymy na inny host
         });
 
         const onMsg = async (payload) => {
@@ -565,6 +561,37 @@ app.get("/tokens", (_req, res) => {
   const token_type = has_access_token ? "Bearer" : null;
   const expires_in = has_access_token ? Math.max(0, Number(tokens.expires_at || 0) - Math.floor(Date.now() / 1000)) : null;
   res.json({ has_access_token, has_refresh_token, token_type, expires_in, obtained_at: tokens?.obtained_at, scope: "user:read chat:write" });
+});
+
+/* --- DIAG: sprawdza endpoint engine.io (polling) dla hostów WS --- */
+app.get("/admin/ws-diag", async (req, res) => {
+  try {
+    const slug = String(req.query.slug || (ALLOWED_SLUGS.split(",")[0] || "")).toLowerCase();
+    const hosts = (process.env.KICK_WS_URL || process.env.KICK_WS_URLS || "wss://ws2.chat.kick.com,wss://ws1.chat.kick.com,wss://chat.kick.com")
+      .split(",").map(s => s.trim()).filter(Boolean);
+    const results = [];
+    for (const wss of hosts) {
+      const https = wss.replace(/^wss:/, "https:");
+      const url = `${https}/socket.io/?EIO=4&transport=polling&t=${Date.now()}`;
+      try {
+        const r = await axios.get(url, {
+          timeout: 8000,
+          headers: { Origin: `https://kick.com/${slug}`, Referer: `https://kick.com/${slug}`, "User-Agent": UA }
+        });
+        results.push({ host: wss, ok: true, status: r.status, data: String(r.data).slice(0,120) });
+      } catch (e) {
+        results.push({
+          host: wss, ok: false,
+          status: e?.response?.status || null,
+          error: e?.message || String(e),
+          body: e?.response?.data ? String(e.response.data).slice(0,120) : null
+        });
+      }
+    }
+    res.json({ slug, results });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e.message });
+  }
 });
 
 /* Admin: ręczne wysłanie (GET) */
